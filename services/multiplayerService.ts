@@ -10,6 +10,7 @@ class MultiplayerService {
   
   private onMessageCallback: ((msg: NetworkMessage) => void) | null = null;
   private hostMessageHandler: ((msg: NetworkMessage, peerId: string) => void) | null = null;
+  private onDisconnectCallback: (() => void) | null = null;
 
   public myPeerId: string | null = null;
 
@@ -83,7 +84,9 @@ class MultiplayerService {
       if (!this.peer) return reject('Peer not initialized');
 
       // Ensure UpperCase for ID match
-      const conn = this.peer.connect(hostId.toUpperCase());
+      const conn = this.peer.connect(hostId.toUpperCase(), {
+          reliable: true
+      });
 
       conn.on('open', () => {
         this.hostConnection = conn;
@@ -126,9 +129,20 @@ class MultiplayerService {
     conn.on('close', () => {
       console.log('Connection closed:', conn.peer);
       this.connections.delete(conn.peer);
+      
+      // If I am client and host closed, trigger disconnect callback
+      if (this.hostConnection === conn) {
+          this.hostConnection = null;
+          if (this.onDisconnectCallback) this.onDisconnectCallback();
+      }
     });
     
-    conn.on('error', (e) => console.error("Conn error", e));
+    conn.on('error', (e) => {
+        console.error("Conn error", e);
+        if (this.hostConnection === conn) {
+             if (this.onDisconnectCallback) this.onDisconnectCallback();
+        }
+    });
   }
 
   public setOnMessage(callback: (msg: NetworkMessage) => void) {
@@ -137,6 +151,10 @@ class MultiplayerService {
   
   public setHostMessageHandler(callback: (msg: NetworkMessage, peerId: string) => void) {
       this.hostMessageHandler = callback;
+  }
+  
+  public setOnDisconnect(callback: () => void) {
+      this.onDisconnectCallback = callback;
   }
 
   // Send Logic
@@ -163,13 +181,16 @@ class MultiplayerService {
   }
 
   public close() {
-    this.peer?.destroy();
-    this.peer = null;
+    if (this.peer) {
+        this.peer.destroy();
+        this.peer = null;
+    }
     this.connections.clear();
     this.hostConnection = null;
     this.myPeerId = null;
     this.onMessageCallback = null;
     this.hostMessageHandler = null;
+    this.onDisconnectCallback = null;
   }
 }
 

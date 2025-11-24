@@ -67,6 +67,7 @@ export type NetworkActionType =
   | 'ASSIGN_ID'     // Host assigning Player ID
   | 'JOIN' 
   | 'SYNC_STATE' 
+  | 'HEARTBEAT'     // Keep-alive signal
   | 'ACTION_DRAW' 
   | 'ACTION_DISCARD' 
   | 'ACTION_EAT' 

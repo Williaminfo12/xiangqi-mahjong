@@ -50,6 +50,7 @@ const App: React.FC = () => {
   const [isHost, setIsHost] = useState<boolean>(true);
   const [showLobby, setShowLobby] = useState(true);
   const [roomId, setRoomId] = useState<string>(""); 
+  const [isDisconnected, setIsDisconnected] = useState(false);
   
   // Inputs
   const [playerNameInput, setPlayerNameInput] = useState<string>("玩家");
@@ -70,6 +71,7 @@ const App: React.FC = () => {
 
   const logsEndRef = useRef<HTMLDivElement>(null);
   const timerRef = useRef<number | null>(null);
+  const lastHeartbeatTime = useRef<number>(Date.now());
 
   // --- Initialization ---
 
@@ -119,6 +121,23 @@ const App: React.FC = () => {
     setIsProcessing(false);
     setSelectedTile(null);
     setDecisionTimer(0);
+    setIsDisconnected(false);
+    lastHeartbeatTime.current = Date.now();
+  };
+
+  const returnToMenu = () => {
+      // If in active game, confirm exit
+      if (game.phase === GamePhase.PLAYING || game.phase === GamePhase.CUTTING || game.phase === GamePhase.DEALING) {
+          if (!window.confirm("確定要退出遊戲並返回主選單嗎？")) return;
+      }
+      
+      multiplayerService.close();
+      setShowLobby(true);
+      setRoomId("");
+      setIsDisconnected(false);
+      setJoinInput("");
+      // Reset to singleplayer lobby default
+      setGame(prev => ({...prev, mode: GameMode.SINGLEPLAYER, phase: GamePhase.LOBBY}));
   };
 
   const toggleMute = () => {
@@ -129,18 +148,9 @@ const App: React.FC = () => {
   // --- Multiplayer Setup (PeerJS) ---
 
   const createRoom = async () => {
-      if (!createRoomIdInput) {
-          alert("請輸入房間代碼");
-          return;
-      }
-      if (!/^[A-Z0-9]{5}$/.test(createRoomIdInput)) {
-          alert("房間代碼必須是5位英數字 (A-Z, 0-9)");
-          return;
-      }
-      if (!playerNameInput.trim()) {
-          alert("請輸入您的暱稱");
-          return;
-      }
+      if (!createRoomIdInput) { alert("請輸入房間代碼"); return; }
+      if (!/^[A-Z0-9]{5}$/.test(createRoomIdInput)) { alert("房間代碼必須是5位英數字"); return; }
+      if (!playerNameInput.trim()) { alert("請輸入您的暱稱"); return; }
 
       setIsConnecting(true);
       try {
@@ -148,12 +158,12 @@ const App: React.FC = () => {
           setRoomId(id);
           initGame(GameMode.MULTIPLAYER, 0, selectedPlayerCount, playerNameInput);
           
-          // Setup Host Handshake
           multiplayerService.setHostMessageHandler((msg, peerId) => {
               if (msg.type === 'REQUEST_JOIN') {
                   handleJoinRequest(msg.payload.name, peerId);
               }
           });
+          multiplayerService.setOnDisconnect(() => setIsDisconnected(true));
 
       } catch (e) {
           console.error(e);
@@ -169,24 +179,24 @@ const App: React.FC = () => {
 
   const joinRoom = async () => {
       if (!joinInput) return;
-      if (!playerNameInput.trim()) {
-          alert("請輸入您的暱稱");
-          return;
-      }
+      if (!playerNameInput.trim()) { alert("請輸入您的暱稱"); return; }
 
       setIsConnecting(true);
       try {
           await multiplayerService.init(undefined, false);
           await multiplayerService.connectToHost(joinInput);
           setIsHost(false);
+          setRoomId(joinInput.toUpperCase());
           
-          // Send Request to Host with Name
           multiplayerService.send('REQUEST_JOIN', { name: playerNameInput });
           
           audioService.playBGM();
           setGame(prev => ({ ...prev, logs: ["正在連線到房間..."] }));
           setShowLobby(false);
+          lastHeartbeatTime.current = Date.now();
           
+          multiplayerService.setOnDisconnect(() => setIsDisconnected(true));
+
       } catch (e) {
           console.error(e);
           alert("加入失敗: 代碼錯誤或無法連線");
@@ -204,19 +214,38 @@ const App: React.FC = () => {
           if (emptyIndex !== -1) {
               newPlayers[emptyIndex] = {
                   ...newPlayers[emptyIndex],
-                  name: name || `玩家 ${emptyIndex}`, // Use provided name
+                  name: name || `玩家 ${emptyIndex}`, 
                   isHuman: true,
                   isReady: false
               };
               
               multiplayerService.sendToPeer(peerId, 'ASSIGN_ID', { id: emptyIndex });
-              
               setTimeout(() => broadcastState(newPlayers), 100);
               
               return { ...prev, players: newPlayers, logs: [...prev.logs, `${name} 加入連線`] };
           }
           return prev;
       });
+  };
+
+  const reconnect = async () => {
+      if (!roomId) return;
+      setIsConnecting(true);
+      try {
+          await multiplayerService.init(undefined, false);
+          await multiplayerService.connectToHost(roomId);
+          
+          // Re-Join as new connection
+          multiplayerService.send('REQUEST_JOIN', { name: playerNameInput });
+          setIsDisconnected(false);
+          lastHeartbeatTime.current = Date.now();
+          
+          multiplayerService.setOnDisconnect(() => setIsDisconnected(true));
+      } catch (e) {
+          alert("重連失敗，請確認房主是否在線");
+      } finally {
+          setIsConnecting(false);
+      }
   };
 
   // --- Network Listeners ---
@@ -240,39 +269,33 @@ const App: React.FC = () => {
         } else {
             if (msg.type === 'ASSIGN_ID') {
                 const myId = msg.payload.id;
-                const myName = msg.payload.name;
                 setMyPlayerId(myId);
-                // initGame is not strictly needed here as SYNC_STATE follows immediately
             }
             else if (msg.type === 'SYNC_STATE') {
                 const serverState = msg.payload;
-                setGame(prev => ({
-                    ...serverState,
-                    mode: GameMode.MULTIPLAYER
-                }));
+                setGame(prev => ({ ...serverState, mode: GameMode.MULTIPLAYER }));
                 if (msg.payload.aux) {
                     setIsProcessing(msg.payload.aux.isProcessing);
                     setWaitingReason(msg.payload.aux.waitingReason);
                     setWinningTile(msg.payload.aux.winningTile);
                     setDecisionTimer(msg.payload.aux.decisionTimer);
                 }
+                lastHeartbeatTime.current = Date.now();
+            }
+            else if (msg.type === 'HEARTBEAT') {
+                lastHeartbeatTime.current = Date.now();
             }
         }
     });
   }, [isHost, game]); 
 
-  // --- Broadcast (Host) ---
+  // --- Broadcast & Heartbeat (Host) ---
   const broadcastState = (playersOverride?: Player[]) => {
       if (isHost && game.mode === GameMode.MULTIPLAYER) {
           multiplayerService.send('SYNC_STATE', {
               ...game,
               players: playersOverride || game.players,
-              aux: {
-                  isProcessing,
-                  waitingReason,
-                  winningTile,
-                  decisionTimer
-              }
+              aux: { isProcessing, waitingReason, winningTile, decisionTimer }
           });
       }
   };
@@ -280,6 +303,24 @@ const App: React.FC = () => {
   useEffect(() => {
       broadcastState();
   }, [game, isProcessing, waitingReason, winningTile, decisionTimer, isHost]);
+
+  // Heartbeat Interval
+  useEffect(() => {
+      if (game.mode !== GameMode.MULTIPLAYER) return;
+
+      const interval = window.setInterval(() => {
+          if (isHost) {
+              multiplayerService.send('HEARTBEAT');
+          } else {
+              // Client Check (timeout 15s)
+              if (!isDisconnected && Date.now() - lastHeartbeatTime.current > 15000) {
+                  setIsDisconnected(true);
+              }
+          }
+      }, 5000);
+
+      return () => clearInterval(interval);
+  }, [isHost, game.mode, isDisconnected]);
 
 
   // --- Game Loop (Host Only) ---
@@ -289,7 +330,6 @@ const App: React.FC = () => {
 
   useEffect(() => {
     if (!isHost) return; 
-
     if (!game.players || game.players.length === 0) return;
     if (game.phase !== GamePhase.PLAYING) return;
     if (waitingReason === 'HU') return;
@@ -316,7 +356,6 @@ const App: React.FC = () => {
 
   useEffect(() => {
     if (!isHost) return;
-
     if (waitingReason === 'TURN_DECISION' && decisionTimer > 0) {
       timerRef.current = window.setTimeout(() => {
         setDecisionTimer(prev => prev - 1);
@@ -331,7 +370,6 @@ const App: React.FC = () => {
   // --- Action Dispatcher ---
   const dispatchAction = (type: NetworkActionType, payload: any = {}, senderOverride?: number) => {
       const sender = senderOverride !== undefined ? senderOverride : myPlayerId;
-      
       if (isHost) {
           audioService.playClick();
           switch(type) {
@@ -350,7 +388,14 @@ const App: React.FC = () => {
                  });
                  break;
               case 'RESTART': 
-                 if(payload.reset) initGame(game.mode, myPlayerId, game.playerCount); 
+                 if(payload.reset) {
+                     setGame(prev => ({
+                        ...prev,
+                        phase: GamePhase.LOBBY,
+                        players: prev.players.map(p => ({...p, hand: [], discards: [], chips: 100, isReady: p.id !== 0})),
+                        logs: ["--- 遊戲重置 ---"]
+                     }));
+                 } 
                  else startGame(); 
                  break;
           }
@@ -364,12 +409,10 @@ const App: React.FC = () => {
   const startGame = () => {
     const deck = shuffleDeck(generateDeck());
     const starter = nextRoundDealer;
-    
     setIsProcessing(false);
     setWaitingReason('NONE');
     setWinningTile(null);
     setSelectedTile(null);
-    
     setGame(prev => ({
       ...prev,
       phase: GamePhase.CUTTING,
@@ -389,7 +432,6 @@ const App: React.FC = () => {
     if (game.phase !== GamePhase.CUTTING) return;
     const dealer = game.players[game.dealerIndex];
     if (!dealer) return;
-
     audioService.playCut();
     setGame(prev => ({ 
         ...prev, 
@@ -397,32 +439,24 @@ const App: React.FC = () => {
         phase: GamePhase.DEALING,
         logs: [...prev.logs, `${dealer.name} 從第 ${stackIndex + 1} 疊開始拿牌`]
     }));
-    
-    if (isHost) {
-        setTimeout(() => dealTiles(stackIndex), 600);
-    }
+    if (isHost) { setTimeout(() => dealTiles(stackIndex), 600); }
   };
 
   useEffect(() => {
     if (isHost && game.phase === GamePhase.CUTTING) {
       const dealer = game.players[game.dealerIndex];
       if (dealer && !dealer.isHuman) {
-        setTimeout(() => {
-          handleCutWall(Math.floor(Math.random() * 16));
-        }, 1000);
+        setTimeout(() => { handleCutWall(Math.floor(Math.random() * 16)); }, 1000);
       }
     }
   }, [game.phase, game.dealerIndex, isHost]);
-
 
   const dealTiles = (startIndex: number) => {
     setGame(current => {
       const newWall = [...current.wall];
       const count = current.players.length;
       if (!current.players || count === 0) return current;
-
       const newPlayers = current.players.map(p => ({ ...p, hand: [] }));
-      
       for (let i = 0; i < count; i++) {
         const pIndex = (current.dealerIndex + i) % count;
         if (newWall.length >= 4) {
@@ -436,7 +470,6 @@ const App: React.FC = () => {
             newPlayers[current.dealerIndex].hand = sortHand([...newPlayers[current.dealerIndex].hand, dealerExtra]);
           }
       }
-
       return {
         ...current,
         wall: newWall,
@@ -457,14 +490,12 @@ const App: React.FC = () => {
         const winner = newPlayers[winnerId];
         let payoutLogs: string[] = [];
         const count = current.players.length;
-
         const isHeavenly = (current.wall.length === 15) && (winnerId === current.dealerIndex) && (loserId === null);
         const isFive = isFivePawns(winningHand);
         let payAmount = 0;
         if (isHeavenly) { payAmount = 50; payoutLogs.push(`🀄 起手倒 (天胡)！每家付 ${payAmount} 元`); } 
         else if (isFive) { payAmount = 50; payoutLogs.push(`♟️ 五兵/五卒合手！支付 ${payAmount} 元`); } 
         else { payAmount = loserId !== null ? 10 : 20; }
-
         let nextDealer = 0;
         if (loserId !== null) {
             const loser = newPlayers[loserId];
@@ -900,6 +931,11 @@ const App: React.FC = () => {
       return (
         <div className="w-full min-h-screen bg-[#1a472a] relative overflow-y-auto text-white flex items-center justify-center p-4">
             <div className="absolute inset-0 felt-texture opacity-50 pointer-events-none fixed"></div>
+            {/* Return Button */}
+            <button onClick={returnToMenu} className="absolute top-4 left-4 z-50 px-4 py-2 bg-red-800/80 rounded-lg hover:bg-red-700 border border-red-500 text-sm font-bold shadow-lg">
+                ← 離開房間
+            </button>
+
             <div className="bg-black/80 p-6 md:p-8 rounded-2xl shadow-2xl w-full max-w-2xl border border-amber-500/30 backdrop-blur-sm z-10 my-8">
                 <div className="flex justify-between items-center mb-6">
                     <h2 className="text-2xl font-bold text-amber-400">準備室</h2>
@@ -962,6 +998,11 @@ const App: React.FC = () => {
       <div className="absolute inset-0 felt-texture opacity-50 pointer-events-none z-0"></div>
       <div className="absolute inset-0 bg-black/20 pointer-events-none z-0" style={{background: 'radial-gradient(circle at center, transparent 0%, rgba(0,0,0,0.6) 100%)'}}></div>
       
+      {/* Return Button */}
+      <button onClick={returnToMenu} className="absolute top-4 left-16 z-50 bg-black/40 p-2 px-4 rounded-full hover:bg-black/60 border border-white/20 text-xs font-bold">
+        離開
+      </button>
+
       <button onClick={toggleMute} className="absolute top-4 left-4 z-50 bg-black/40 p-2 rounded-full hover:bg-black/60 border border-white/20">
         {isMuted ? "🔇" : "🔊"}
       </button>
@@ -1100,6 +1141,20 @@ const App: React.FC = () => {
         </div>
       </div>
       
+      {/* Disconnect Modal */}
+      {isDisconnected && (
+          <div className="absolute inset-0 bg-black/90 flex items-center justify-center z-[100] backdrop-blur-md p-4">
+              <div className="bg-red-900/50 p-8 rounded-2xl border-2 border-red-500 text-center max-w-md">
+                  <h2 className="text-2xl font-bold text-red-400 mb-4">連線中斷</h2>
+                  <p className="text-gray-300 mb-6">您已與伺服器斷開連線。</p>
+                  <div className="flex gap-4 justify-center">
+                      <button onClick={reconnect} className="px-6 py-2 bg-blue-600 hover:bg-blue-500 rounded-lg font-bold">嘗試重連</button>
+                      <button onClick={() => { setIsDisconnected(false); returnToMenu(); }} className="px-6 py-2 bg-gray-600 hover:bg-gray-500 rounded-lg font-bold">回到主選單</button>
+                  </div>
+              </div>
+          </div>
+      )}
+      
       {isProcessing && (
           <div className="absolute top-20 left-1/2 -translate-x-1/2 z-50">
              <div className="bg-black/60 text-white px-4 py-1 rounded-full text-sm flex items-center gap-2 backdrop-blur-md">
@@ -1155,6 +1210,10 @@ const App: React.FC = () => {
             ) : (
                 <div className="text-amber-500 animate-pulse">等待房主開始下一局...</div>
             )}
+            
+            <button onClick={returnToMenu} className="text-sm text-gray-400 underline hover:text-white mt-2">
+                回到大廳
+            </button>
           </div>
         </div>
       )}
