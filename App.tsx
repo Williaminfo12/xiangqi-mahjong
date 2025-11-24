@@ -346,9 +346,11 @@ const App: React.FC = () => {
               case 'ACTION_CUT': if(payload.index !== undefined) handleCutWall(payload.index); break;
               case 'ACTION_TOGGLE_READY': 
                  setGame(prev => {
-                     const ps = [...prev.players];
-                     if(ps[sender]) ps[sender].isReady = !ps[sender].isReady;
-                     return {...prev, players: ps};
+                     // Corrected: Use .map for immutable update to trigger re-renders/effects correctly
+                     const newPlayers = prev.players.map((p, i) => 
+                        i === sender ? { ...p, isReady: !p.isReady } : p
+                     );
+                     return {...prev, players: newPlayers};
                  });
                  break;
               case 'RESTART': 
@@ -814,16 +816,17 @@ const App: React.FC = () => {
                                     </button>
                                 </div>
                                 
-                                <div className="flex gap-2 pt-2 border-t border-white/5">
+                                {/* Join Room Input - Vertical stack for mobile visibility */}
+                                <div className="flex flex-col sm:flex-row gap-2 pt-4 border-t border-white/10">
                                     <input 
                                         type="text" 
                                         placeholder="輸入房號加入"
                                         value={joinInput}
                                         onChange={(e) => setJoinInput(e.target.value.toUpperCase())}
-                                        className="flex-1 px-4 py-2 bg-gray-800 rounded-lg border border-gray-600 focus:outline-none focus:border-amber-400 text-center uppercase"
+                                        className="w-full sm:flex-1 px-4 py-3 bg-gray-800 rounded-lg border border-gray-600 focus:outline-none focus:border-amber-400 text-center uppercase shadow-inner"
                                     />
                                     <button onClick={joinRoom} disabled={isConnecting || !joinInput}
-                                        className="px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded-lg border border-gray-500 font-bold"
+                                        className="w-full sm:w-auto px-6 py-3 bg-gray-700 hover:bg-gray-600 rounded-lg border border-gray-500 font-bold shadow-md active:scale-95 transition-transform"
                                     >
                                         加入
                                     </button>
