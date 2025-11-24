@@ -53,7 +53,7 @@ const App: React.FC = () => {
   
   // Inputs
   const [joinInput, setJoinInput] = useState<string>("");
-  const [createRoomIdInput, setCreateRoomIdInput] = useState<string>(""); // New state for custom ID
+  const [createRoomIdInput, setCreateRoomIdInput] = useState<string>(""); 
 
   const [isConnecting, setIsConnecting] = useState(false);
   const [copySuccess, setCopySuccess] = useState("");
@@ -77,7 +77,6 @@ const App: React.FC = () => {
     const isMultiplayer = mode === GameMode.MULTIPLAYER;
     const host = isMultiplayer ? myId === 0 : true;
 
-    // Create Players array of length 'count'
     const players: Player[] = Array.from({ length: count }).map((_, i) => ({
       id: i,
       name: PLAYER_NAMES[i] || `玩家 ${i}`,
@@ -88,12 +87,10 @@ const App: React.FC = () => {
       chips: 100 
     }));
     
-    // For multiplayer host, initialize others as not ready
     if (isMultiplayer && host) {
         players.forEach((p, i) => { if (i !== 0) p.name = "等待加入..."; });
     }
     
-    // For multiplayer client, set self as not ready
     if (isMultiplayer && !host) {
         if(players[myId]) players[myId].isReady = false;
     }
@@ -135,7 +132,6 @@ const App: React.FC = () => {
   // --- Multiplayer Setup (PeerJS) ---
 
   const createRoom = async () => {
-      // Validation: 5 alphanumeric characters
       if (!createRoomIdInput) {
           alert("請輸入房間代碼");
           return;
@@ -147,7 +143,6 @@ const App: React.FC = () => {
 
       setIsConnecting(true);
       try {
-          // Pass custom ID to init (first arg)
           const id = await multiplayerService.init(createRoomIdInput, false);
           setRoomId(id);
           initGame(GameMode.MULTIPLAYER, 0, selectedPlayerCount);
@@ -175,12 +170,10 @@ const App: React.FC = () => {
       if (!joinInput) return;
       setIsConnecting(true);
       try {
-          // Pass no ID, requestShortId=false (Clients use random UUID)
           await multiplayerService.init(undefined, false);
           await multiplayerService.connectToHost(joinInput);
           setIsHost(false);
           
-          // Send Request to Host
           multiplayerService.send('REQUEST_JOIN', { name: "玩家" });
           
           audioService.playBGM();
@@ -199,7 +192,6 @@ const App: React.FC = () => {
   const handleJoinRequest = (name: string, peerId: string) => {
       setGame(prev => {
           const newPlayers = [...prev.players];
-          // Find first empty slot (not human, not P0)
           const emptyIndex = newPlayers.findIndex((p, i) => i !== 0 && !p.isHuman);
           
           if (emptyIndex !== -1) {
@@ -210,10 +202,8 @@ const App: React.FC = () => {
                   isReady: false
               };
               
-              // Reply to Client
               multiplayerService.sendToPeer(peerId, 'ASSIGN_ID', { id: emptyIndex });
               
-              // Broadcast update
               setTimeout(() => broadcastState(newPlayers), 100);
               
               return { ...prev, players: newPlayers, logs: [...prev.logs, `玩家 ${emptyIndex} 加入連線`] };
@@ -223,7 +213,9 @@ const App: React.FC = () => {
   };
 
   // --- Network Listeners ---
-  // (No changes here)
+  
+  // CRITICAL FIX: Added 'game' to dependency array.
+  // This prevents stale closures where the host processes actions using old game state.
   useEffect(() => {
     multiplayerService.setOnMessage((msg: NetworkMessage) => {
         if (isHost) {
@@ -244,8 +236,6 @@ const App: React.FC = () => {
             if (msg.type === 'ASSIGN_ID') {
                 const myId = msg.payload.id;
                 setMyPlayerId(myId);
-                // Note: We don't call initGame here to avoid overwriting state before sync
-                // We wait for SYNC_STATE
             }
             else if (msg.type === 'SYNC_STATE') {
                 const serverState = msg.payload;
@@ -262,7 +252,7 @@ const App: React.FC = () => {
             }
         }
     });
-  }, [isHost]); 
+  }, [isHost, game]); 
 
   // --- Broadcast (Host) ---
   const broadcastState = (playersOverride?: Player[]) => {
@@ -346,7 +336,7 @@ const App: React.FC = () => {
               case 'ACTION_CUT': if(payload.index !== undefined) handleCutWall(payload.index); break;
               case 'ACTION_TOGGLE_READY': 
                  setGame(prev => {
-                     // Corrected: Use .map for immutable update to trigger re-renders/effects correctly
+                     // FIX: Use .map for immutable update to guarantee re-render and effect trigger
                      const newPlayers = prev.players.map((p, i) => 
                         i === sender ? { ...p, isReady: !p.isReady } : p
                      );
