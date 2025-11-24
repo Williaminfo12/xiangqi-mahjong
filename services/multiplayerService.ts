@@ -13,29 +13,67 @@ class MultiplayerService {
 
   public myPeerId: string | null = null;
 
+  // Generate a readable 5-char ID (No I, 1, O, 0 to avoid confusion)
+  private generateShortId(): string {
+      const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+      let result = '';
+      for (let i = 0; i < 5; i++) {
+        result += chars.charAt(Math.floor(Math.random() * chars.length));
+      }
+      return result;
+  }
+
   // Initialize Peer
-  public async init(): Promise<string> {
+  // customId: Optional specific ID requested by user
+  // requestShortId: If no customId, true tries to generate a 5-char random ID, false gives UUID
+  public async init(customId?: string, requestShortId: boolean = false): Promise<string> {
     this.close(); // Cleanup
 
     return new Promise((resolve, reject) => {
-      this.peer = new Peer(); // Auto-generate ID from PeerJS server
+      
+      const tryInit = () => {
+          // Priority: Custom ID -> Random Short ID -> Undefined (Auto UUID)
+          const idToUse = customId || (requestShortId ? this.generateShortId() : undefined);
+          
+          const peer = new Peer(idToUse); 
 
-      this.peer.on('open', (id) => {
-        this.myPeerId = id;
-        console.log('My Peer ID:', id);
-        resolve(id);
-      });
+          peer.on('open', (assignedId) => {
+            this.peer = peer;
+            this.myPeerId = assignedId;
+            console.log('My Peer ID:', assignedId);
+            resolve(assignedId);
+          });
 
-      this.peer.on('error', (err) => {
-        console.error('Peer error:', err);
-        // We generally don't reject here because 'error' can happen anytime, 
-        // but for init, 'open' is the success criteria.
-      });
+          peer.on('error', (err: any) => {
+            console.warn('Peer error:', err.type);
+            
+            if (err.type === 'unavailable-id' || err.type === 'peer-unavailable') {
+                if (customId) {
+                    // If user manually set an ID and it's taken, reject immediately so UI can tell them
+                    console.error("Custom ID collision");
+                    peer.destroy();
+                    reject('ID_TAKEN');
+                } else if (requestShortId) {
+                    // If we are generating random short IDs and hit a collision, retry automatically
+                    console.log("Random ID Collision, retrying...");
+                    peer.destroy();
+                    tryInit(); 
+                } else {
+                   if (!this.peer) reject(err);
+                }
+            } else {
+                // Real error (network, etc)
+                if (!this.peer) reject(err);
+            }
+          });
 
-      // Host Logic: Handle incoming connections
-      this.peer.on('connection', (conn) => {
-        this.handleIncomingConnection(conn);
-      });
+          // Host Logic: Handle incoming connections
+          peer.on('connection', (conn) => {
+            this.handleIncomingConnection(conn);
+          });
+      };
+
+      tryInit();
     });
   }
 
@@ -44,7 +82,8 @@ class MultiplayerService {
     return new Promise((resolve, reject) => {
       if (!this.peer) return reject('Peer not initialized');
 
-      const conn = this.peer.connect(hostId);
+      // Ensure UpperCase for ID match
+      const conn = this.peer.connect(hostId.toUpperCase());
 
       conn.on('open', () => {
         this.hostConnection = conn;

@@ -50,7 +50,11 @@ const App: React.FC = () => {
   const [isHost, setIsHost] = useState<boolean>(true);
   const [showLobby, setShowLobby] = useState(true);
   const [roomId, setRoomId] = useState<string>(""); 
+  
+  // Inputs
   const [joinInput, setJoinInput] = useState<string>("");
+  const [createRoomIdInput, setCreateRoomIdInput] = useState<string>(""); // New state for custom ID
+
   const [isConnecting, setIsConnecting] = useState(false);
   const [copySuccess, setCopySuccess] = useState("");
   const [selectedPlayerCount, setSelectedPlayerCount] = useState<number>(4);
@@ -121,8 +125,6 @@ const App: React.FC = () => {
     setIsProcessing(false);
     setSelectedTile(null);
     setDecisionTimer(0);
-
-    // Client handshake is handled in joinRoom
   };
 
   const toggleMute = () => {
@@ -133,9 +135,20 @@ const App: React.FC = () => {
   // --- Multiplayer Setup (PeerJS) ---
 
   const createRoom = async () => {
+      // Validation: 5 alphanumeric characters
+      if (!createRoomIdInput) {
+          alert("請輸入房間代碼");
+          return;
+      }
+      if (!/^[A-Z0-9]{5}$/.test(createRoomIdInput)) {
+          alert("房間代碼必須是5位英數字 (A-Z, 0-9)");
+          return;
+      }
+
       setIsConnecting(true);
       try {
-          const id = await multiplayerService.init();
+          // Pass custom ID to init (first arg)
+          const id = await multiplayerService.init(createRoomIdInput, false);
           setRoomId(id);
           initGame(GameMode.MULTIPLAYER, 0, selectedPlayerCount);
           
@@ -148,7 +161,11 @@ const App: React.FC = () => {
 
       } catch (e) {
           console.error(e);
-          alert("建立房間失敗 (PeerJS Error)");
+          if (e === 'ID_TAKEN') {
+              alert("此代碼已被使用，請更換一個");
+          } else {
+              alert("建立房間失敗 (連線錯誤)");
+          }
       } finally {
           setIsConnecting(false);
       }
@@ -158,7 +175,8 @@ const App: React.FC = () => {
       if (!joinInput) return;
       setIsConnecting(true);
       try {
-          await multiplayerService.init();
+          // Pass no ID, requestShortId=false (Clients use random UUID)
+          await multiplayerService.init(undefined, false);
           await multiplayerService.connectToHost(joinInput);
           setIsHost(false);
           
@@ -171,7 +189,7 @@ const App: React.FC = () => {
           
       } catch (e) {
           console.error(e);
-          alert("加入失敗: ID錯誤或無法連線");
+          alert("加入失敗: 代碼錯誤或無法連線");
           setShowLobby(true);
       } finally {
           setIsConnecting(false);
@@ -205,11 +223,10 @@ const App: React.FC = () => {
   };
 
   // --- Network Listeners ---
-
+  // (No changes here)
   useEffect(() => {
     multiplayerService.setOnMessage((msg: NetworkMessage) => {
         if (isHost) {
-            // Host handling actions from clients
             switch(msg.type) {
                 case 'ACTION_TOGGLE_READY':
                 case 'ACTION_DRAW':
@@ -224,12 +241,10 @@ const App: React.FC = () => {
                      break;
             }
         } else {
-            // Client receiving updates
             if (msg.type === 'ASSIGN_ID') {
                 const myId = msg.payload.id;
                 setMyPlayerId(myId);
-                // Initialize local game state placeholder until sync
-                initGame(GameMode.MULTIPLAYER, myId, 4); // Count will be overwritten by sync
+                initGame(GameMode.MULTIPLAYER, myId, 4); 
             }
             else if (msg.type === 'SYNC_STATE') {
                 const serverState = msg.payload;
@@ -270,7 +285,6 @@ const App: React.FC = () => {
 
 
   // --- Game Loop (Host Only) ---
-
   useEffect(() => {
     logsEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [game.logs]);
@@ -317,7 +331,6 @@ const App: React.FC = () => {
 
 
   // --- Action Dispatcher ---
-
   const dispatchAction = (type: NetworkActionType, payload: any = {}, senderOverride?: number) => {
       const sender = senderOverride !== undefined ? senderOverride : myPlayerId;
       
@@ -349,7 +362,6 @@ const App: React.FC = () => {
 
 
   // --- Logic Methods (Host State Modifiers) ---
-
   const startGame = () => {
     const deck = shuffleDeck(generateDeck());
     const starter = nextRoundDealer;
@@ -412,7 +424,6 @@ const App: React.FC = () => {
 
       const newPlayers = current.players.map(p => ({ ...p, hand: [] }));
       
-      // Deal 4 cards to everyone
       for (let i = 0; i < count; i++) {
         const pIndex = (current.dealerIndex + i) % count;
         if (newWall.length >= 4) {
@@ -420,7 +431,6 @@ const App: React.FC = () => {
             if (newPlayers[pIndex]) newPlayers[pIndex].hand = sortHand(draw);
         }
       }
-      // Dealer extra card
       if (newWall.length > 0) {
           const dealerExtra = newWall.shift();
           if (dealerExtra && newPlayers[current.dealerIndex]) {
@@ -488,7 +498,7 @@ const App: React.FC = () => {
   const startTurnDecision = (nextPlayerIndex: number) => {
       setGame(prev => ({ ...prev, turnIndex: nextPlayerIndex }));
       setWaitingReason('TURN_DECISION');
-      setDecisionTimer(10); // Changed to 10 seconds
+      setDecisionTimer(10); 
       setIsProcessing(false); 
   };
 
@@ -520,7 +530,6 @@ const App: React.FC = () => {
   };
 
   const handleEat = async (playerIndex: number) => {
-      // 2 Player Rule: Cannot Eat
       if (game.playerCount === 2) return;
 
       if (!game.lastDiscard) return;
@@ -535,24 +544,14 @@ const App: React.FC = () => {
           const tile = prev.lastDiscard!;
           const newHand = sortHand([...p.hand, tile]);
           
-          // Identify discarder
           const count = prev.players.length;
-          // In standard logic, discarder is previous turn. 
-          // Reverse: (current - 1 + count) % count? No, last turn was turnIndex before this decision phase.
-          // Since we are IN decision phase, turnIndex is already the person who MIGHT draw.
-          // But wait, "Eat" steals the turn. The person Eating MUST be (Discarder + 1) % count in standard MJ,
-          // but here "Any player can Eat"? The rule was "Unconditional Eat".
-          // If we assume standard play flow where discarder is (turnIndex - 1), 
-          // we need to find who discarded 'lastDiscard'.
-          
-          // Simplified: We assume Discarder is (turnIndex + count - 1) % count.
           const discarderIndex = (playerIndex + count - 1) % count;
           const discarder = prev.players[discarderIndex];
           
-          if (!discarder) return prev; // Safety
+          if (!discarder) return prev; 
           
           const newDiscards = [...discarder.discards];
-          newDiscards.pop(); // Remove from table
+          newDiscards.pop(); 
           
           const newPlayers = [...prev.players];
           newPlayers[playerIndex] = { ...p, hand: newHand };
@@ -579,7 +578,6 @@ const App: React.FC = () => {
           let winnerFound = -1;
           const count = game.players.length;
           
-          // Check other players for Win
           for (let i = 1; i < count; i++) {
               const checkIdx = (playerId + i) % count;
               const playerToCheck = game.players[checkIdx]; 
@@ -679,24 +677,11 @@ const App: React.FC = () => {
       });
   };
 
-
-  // --- View Rendering Logic ---
-
-  // Dynamic Position Mapping
-  // Returns standard position index (0:Bottom, 1:Right, 2:Top, 3:Left) based on relative index
+  // --- View Rendering Helpers ---
   const getRelativePosition = (playerId: number, myId: number, totalPlayers: number) => {
-      // Calculate relative index from self (0 to total-1)
       let rel = (playerId - myId + totalPlayers) % totalPlayers;
-      
-      if (totalPlayers === 2) {
-          // 2 Players: 0->Bottom, 1->Top
-          return rel === 0 ? 0 : 2;
-      }
-      if (totalPlayers === 3) {
-          // 3 Players: 0->Bottom, 1->Right, 2->Left
-          return rel === 0 ? 0 : (rel === 1 ? 1 : 3);
-      }
-      // 4 Players: Standard rotation
+      if (totalPlayers === 2) return rel === 0 ? 0 : 2;
+      if (totalPlayers === 3) return rel === 0 ? 0 : (rel === 1 ? 1 : 3);
       return rel;
   };
 
@@ -735,7 +720,6 @@ const App: React.FC = () => {
       );
   };
 
-  // Styles based on 0(Bot), 1(Right), 2(Top), 3(Left)
   const getPlayerStyle = (stdPos: number) => {
     switch (stdPos) {
         case 0: return { bottom: '100px', left: '50%', transform: 'translate(-50%, 0)', zIndex: 30 };
@@ -770,7 +754,7 @@ const App: React.FC = () => {
   const isMyTurn = game.turnIndex === myPlayerId;
   const canDraw = waitingReason === 'TURN_DECISION' && isMyTurn;
   const canDiscard = waitingReason === 'NONE' && isMyTurn && !isProcessing;
-  const canEat = game.lastDiscard && game.playerCount !== 2; // 2 Player Rule: No Eat
+  const canEat = game.lastDiscard && game.playerCount !== 2; 
   const isSessionOver = game.players.some(p => p.chips <= 0);
   const canCut = game.phase === GamePhase.CUTTING && game.dealerIndex === myPlayerId;
   const allPlayersReady = game.players.every(p => p.isReady);
@@ -809,21 +793,33 @@ const App: React.FC = () => {
 
                     <div className="border-t border-white/10 pt-4">
                         <h3 className="text-gray-400 mb-4 text-sm font-bold">多人連線 (P2P)</h3>
+                        
+                        {/* Lobby Logic: Create Room with Custom ID */}
                         {!roomId ? (
                              <div className="space-y-4">
-                                <button onClick={createRoom} disabled={isConnecting}
-                                    className="w-full py-3 bg-blue-900 hover:bg-blue-800 rounded-lg font-bold border border-blue-500 flex justify-center items-center"
-                                >
-                                    {isConnecting ? <div className="w-5 h-5 border-2 border-t-transparent border-white rounded-full animate-spin"></div> : "建立房間 (我是房主)"}
-                                </button>
-                                
                                 <div className="flex gap-2">
+                                     <input 
+                                        type="text" 
+                                        placeholder="設定房號(5碼)"
+                                        value={createRoomIdInput}
+                                        onChange={(e) => setCreateRoomIdInput(e.target.value.toUpperCase())}
+                                        maxLength={5}
+                                        className="w-32 px-2 py-2 bg-gray-800 rounded-lg border border-blue-500 focus:outline-none text-center uppercase text-sm tracking-widest"
+                                    />
+                                    <button onClick={createRoom} disabled={isConnecting}
+                                        className="flex-1 py-2 bg-blue-900 hover:bg-blue-800 rounded-lg font-bold border border-blue-500 flex justify-center items-center text-sm"
+                                    >
+                                        {isConnecting ? "建立中..." : "建立房間"}
+                                    </button>
+                                </div>
+                                
+                                <div className="flex gap-2 pt-2 border-t border-white/5">
                                     <input 
                                         type="text" 
-                                        placeholder="輸入房間代碼"
+                                        placeholder="輸入房號加入"
                                         value={joinInput}
-                                        onChange={(e) => setJoinInput(e.target.value)}
-                                        className="flex-1 px-4 py-2 bg-gray-800 rounded-lg border border-gray-600 focus:outline-none focus:border-amber-400 text-center"
+                                        onChange={(e) => setJoinInput(e.target.value.toUpperCase())}
+                                        className="flex-1 px-4 py-2 bg-gray-800 rounded-lg border border-gray-600 focus:outline-none focus:border-amber-400 text-center uppercase"
                                     />
                                     <button onClick={joinRoom} disabled={isConnecting || !joinInput}
                                         className="px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded-lg border border-gray-500 font-bold"
@@ -842,7 +838,7 @@ const App: React.FC = () => {
                              </div>
                         )}
                         <p className="text-xs text-gray-500 mt-4">
-                            * 支援跨裝置連線。傳送代碼給朋友即可加入。
+                            * 支援跨裝置連線，請輸入 5 位英數字作為房號。
                         </p>
                     </div>
                 </div>
@@ -947,9 +943,7 @@ const App: React.FC = () => {
         </div>
 
         {game.players.map(player => {
-            // Calculate Position
             const stdPos = getRelativePosition(player.id, myPlayerId, game.playerCount);
-            
             return (
                 <React.Fragment key={player.id}>
                     <div className="absolute origin-center" style={getDiscardStyle(stdPos)}>
