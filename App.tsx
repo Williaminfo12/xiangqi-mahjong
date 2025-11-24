@@ -1,0 +1,987 @@
+
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { 
+  GamePhase, 
+  GameState, 
+  Player, 
+  TileData,
+  GameMode,
+  NetworkMessage,
+  NetworkActionType
+} from './types';
+import { 
+  generateDeck, 
+  PLAYER_NAMES, 
+  AVATARS 
+} from './constants';
+import { 
+  shuffleDeck, 
+  sortHand, 
+  checkWin, 
+  checkWinWithTile,
+  getBestDiscard,
+  getChiCombinations,
+  isFivePawns
+} from './utils/gameLogic';
+import Tile from './components/Tile';
+import Wall from './components/Wall';
+import multiplayerService from './services/multiplayerService';
+import audioService from './services/audioService';
+
+const App: React.FC = () => {
+  // --- State ---
+  const [game, setGame] = useState<GameState>({
+    mode: GameMode.SINGLEPLAYER,
+    phase: GamePhase.LOBBY,
+    turnIndex: 0,
+    dealerIndex: 0,
+    wall: [],
+    wallBreakIndex: 0,
+    players: [],
+    lastDiscard: null,
+    winnerId: null,
+    loserId: null,
+    winningHand: null,
+    logs: ["歡迎來到四人車馬炮！"],
+  });
+
+  // Multiplayer State
+  const [myPlayerId, setMyPlayerId] = useState<number>(0); // Default 0 (Host/Self)
+  const [isHost, setIsHost] = useState<boolean>(true); // Default True (Singleplayer)
+  const [showLobby, setShowLobby] = useState(true);
+
+  const [isProcessing, setIsProcessing] = useState(false); 
+  const [winningTile, setWinningTile] = useState<TileData | null>(null); 
+  const [waitingReason, setWaitingReason] = useState<'NONE' | 'HU' | 'TURN_DECISION'>('NONE');
+  const [selectedTile, setSelectedTile] = useState<TileData | null>(null); 
+  const [decisionTimer, setDecisionTimer] = useState(0);
+  const [nextRoundDealer, setNextRoundDealer] = useState(0);
+  const [isMuted, setIsMuted] = useState(false);
+
+  const logsEndRef = useRef<HTMLDivElement>(null);
+  const timerRef = useRef<number | null>(null);
+
+  // --- Initialization ---
+
+  const initGame = (mode: GameMode, myId: number) => {
+    audioService.playBGM();
+    const isMultiplayer = mode === GameMode.MULTIPLAYER;
+    const host = isMultiplayer ? myId === 0 : true;
+
+    const players: Player[] = Array.from({ length: 4 }).map((_, i) => ({
+      id: i,
+      name: PLAYER_NAMES[i],
+      isHuman: isMultiplayer ? (i === myId) : (i === 0), 
+      isReady: !isMultiplayer || (host && i === 0) || (i !== 0 && i !== myId), 
+      hand: [],
+      discards: [],
+      chips: 100 
+    }));
+    
+    if (isMultiplayer && !host) {
+        players[myId].isReady = false;
+    }
+
+    const randomStarter = Math.floor(Math.random() * 4);
+
+    setGame({
+      mode,
+      phase: GamePhase.LOBBY,
+      turnIndex: 0,
+      dealerIndex: 0,
+      wall: [],
+      wallBreakIndex: 0,
+      players,
+      lastDiscard: null,
+      winnerId: null,
+      loserId: null,
+      winningHand: null,
+      logs: [`模式: ${isMultiplayer ? '多人連線' : '單機'}`, `我是玩家: ${myId} (${host ? '房主' : '參加者'})`],
+    });
+
+    setNextRoundDealer(randomStarter);
+    setMyPlayerId(myId);
+    setIsHost(host);
+    setShowLobby(false);
+    setWinningTile(null);
+    setWaitingReason('NONE');
+    setIsProcessing(false);
+    setSelectedTile(null);
+    setDecisionTimer(0);
+
+    if (isMultiplayer && !host) {
+        multiplayerService.send('JOIN', { name: `玩家 ${myId}` }, myId);
+    }
+  };
+
+  const toggleMute = () => {
+      const muted = audioService.toggleMute();
+      setIsMuted(muted);
+  };
+
+  // --- Network Listeners ---
+
+  useEffect(() => {
+    multiplayerService.setOnMessage((msg: NetworkMessage) => {
+        if (isHost) {
+            switch(msg.type) {
+                case 'JOIN':
+                    const joinerId = msg.senderId;
+                    if (joinerId !== undefined) {
+                        setGame(prev => {
+                            const newPlayers = [...prev.players];
+                            if (newPlayers[joinerId]) {
+                                newPlayers[joinerId].isHuman = true;
+                                newPlayers[joinerId].isReady = false;
+                                return { ...prev, players: newPlayers, logs: [...prev.logs, `玩家 ${joinerId} 已加入連線`] };
+                            }
+                            return prev;
+                        });
+                    }
+                    break;
+                case 'ACTION_TOGGLE_READY':
+                    if (msg.senderId !== undefined) {
+                        setGame(prev => {
+                            const newPlayers = [...prev.players];
+                            if (newPlayers[msg.senderId!]) {
+                                newPlayers[msg.senderId!].isReady = !newPlayers[msg.senderId!].isReady;
+                            }
+                            return { ...prev, players: newPlayers };
+                        });
+                        audioService.playClick();
+                    }
+                    break;
+                case 'ACTION_DRAW':
+                    if (msg.senderId !== undefined) performDraw(msg.senderId);
+                    break;
+                case 'ACTION_DISCARD':
+                    if (msg.senderId !== undefined && msg.payload.tile) handleDiscardProcess(msg.senderId, msg.payload.tile);
+                    break;
+                case 'ACTION_EAT':
+                    if (msg.senderId !== undefined) handleEat(msg.senderId);
+                    break;
+                case 'ACTION_WIN':
+                    if (msg.senderId !== undefined) handleHumanWin(msg.senderId);
+                    break;
+                case 'ACTION_PASS':
+                    handlePass();
+                    break;
+                case 'ACTION_CUT':
+                    if (msg.payload.index !== undefined) handleCutWall(msg.payload.index);
+                    break;
+                case 'RESTART':
+                     break;
+            }
+        } else {
+            if (msg.type === 'SYNC_STATE') {
+                const serverState = msg.payload;
+                setGame(prev => ({
+                    ...serverState,
+                    mode: prev.mode
+                }));
+                if (msg.payload.aux) {
+                    setIsProcessing(msg.payload.aux.isProcessing);
+                    setWaitingReason(msg.payload.aux.waitingReason);
+                    setWinningTile(msg.payload.aux.winningTile);
+                    setDecisionTimer(msg.payload.aux.decisionTimer);
+                }
+            }
+        }
+    });
+  }, [isHost, myPlayerId, game.players]); 
+
+  // --- State Broadcasting (Host Only) ---
+  useEffect(() => {
+      if (isHost && game.mode === GameMode.MULTIPLAYER) {
+          multiplayerService.send('SYNC_STATE', {
+              ...game,
+              aux: {
+                  isProcessing,
+                  waitingReason,
+                  winningTile,
+                  decisionTimer
+              }
+          });
+      }
+  }, [game, isProcessing, waitingReason, winningTile, decisionTimer, isHost]);
+
+
+  // --- Game Logic Hooks (Host Only) ---
+
+  useEffect(() => {
+    logsEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [game.logs]);
+
+  useEffect(() => {
+    if (!isHost) return; 
+
+    if (!game.players || game.players.length === 0) return;
+    if (game.phase !== GamePhase.PLAYING) return;
+    if (waitingReason === 'HU') return;
+
+    const currentPlayer = game.players[game.turnIndex];
+    if (!currentPlayer) return;
+
+    if (waitingReason === 'TURN_DECISION') {
+        if (!currentPlayer.isHuman && !isProcessing) {
+            setIsProcessing(true);
+            setTimeout(() => executeBotDecision(currentPlayer), 1000);
+        }
+        return;
+    }
+
+    if (waitingReason === 'NONE' && !currentPlayer.isHuman && !isProcessing) {
+         if (currentPlayer.hand.length % 3 === 2) {
+             setIsProcessing(true);
+             setTimeout(() => executeBotDiscardPhase(currentPlayer), 500);
+         }
+    }
+
+  }, [game.phase, game.turnIndex, game.players, isProcessing, waitingReason, isHost]);
+
+  useEffect(() => {
+    if (!isHost) return;
+
+    if (waitingReason === 'TURN_DECISION' && decisionTimer > 0) {
+      timerRef.current = window.setTimeout(() => {
+        setDecisionTimer(prev => prev - 1);
+      }, 1000);
+    } else if (waitingReason === 'TURN_DECISION' && decisionTimer === 0) {
+      handleDefaultAction();
+    }
+    return () => { if (timerRef.current) clearTimeout(timerRef.current); };
+  }, [waitingReason, decisionTimer, isHost]);
+
+
+  // --- Actions Dispatcher ---
+
+  const dispatchAction = (type: NetworkActionType, payload: any = {}) => {
+      audioService.playClick();
+      if (isHost) {
+          switch(type) {
+              case 'ACTION_DRAW': performDraw(myPlayerId); break;
+              case 'ACTION_DISCARD': if(payload.tile) handleDiscardProcess(myPlayerId, payload.tile); break;
+              case 'ACTION_EAT': handleEat(myPlayerId); break;
+              case 'ACTION_WIN': handleHumanWin(myPlayerId); break;
+              case 'ACTION_PASS': handlePass(); break;
+              case 'ACTION_CUT': if(payload.index !== undefined) handleCutWall(payload.index); break;
+              case 'ACTION_TOGGLE_READY': 
+                 setGame(prev => {
+                     const ps = [...prev.players];
+                     if(ps[myPlayerId]) ps[myPlayerId].isReady = !ps[myPlayerId].isReady;
+                     return {...prev, players: ps};
+                 });
+                 break;
+              case 'RESTART': if(payload.reset) initGame(game.mode, myPlayerId); else startGame(); break;
+          }
+      } else {
+          multiplayerService.send(type, payload, myPlayerId);
+      }
+  };
+
+
+  // --- Core Logic Functions (Host State Modifiers) ---
+
+  const addLog = (msg: string) => {
+    setGame(prev => ({ ...prev, logs: [...prev.logs, msg] }));
+  };
+
+  const startGame = () => {
+    if (!isHost) { dispatchAction('RESTART', { reset: false }); return; }
+
+    const deck = shuffleDeck(generateDeck());
+    const starter = nextRoundDealer;
+    
+    setIsProcessing(false);
+    setWaitingReason('NONE');
+    setWinningTile(null);
+    setSelectedTile(null);
+    
+    setGame(prev => ({
+      ...prev,
+      phase: GamePhase.CUTTING,
+      wall: deck,
+      dealerIndex: starter,
+      turnIndex: starter,
+      players: prev.players.map(p => ({...p, hand: [], discards: []})),
+      logs: [...prev.logs, `--- 新回合開始 ---`, `由 ${prev.players[starter]?.name || '玩家'} 起手 (切牌)`],
+      lastDiscard: null,
+      winnerId: null,
+      loserId: null,
+      winningHand: null
+    }));
+  };
+
+  const handleCutWall = (stackIndex: number) => {
+    if (game.phase !== GamePhase.CUTTING) return;
+    const dealer = game.players[game.dealerIndex];
+    if (!dealer) return;
+
+    audioService.playCut();
+    setGame(prev => ({ 
+        ...prev, 
+        wallBreakIndex: stackIndex, 
+        phase: GamePhase.DEALING,
+        logs: [...prev.logs, `${dealer.name} 從第 ${stackIndex + 1} 疊開始拿牌`]
+    }));
+    
+    if (isHost) {
+        setTimeout(() => dealTiles(stackIndex), 600);
+    }
+  };
+
+  useEffect(() => {
+    if (isHost && game.phase === GamePhase.CUTTING) {
+      const dealer = game.players[game.dealerIndex];
+      if (dealer && !dealer.isHuman) {
+        setTimeout(() => {
+          handleCutWall(Math.floor(Math.random() * 16));
+        }, 1000);
+      }
+    }
+  }, [game.phase, game.dealerIndex, isHost]);
+
+
+  const dealTiles = (startIndex: number) => {
+    setGame(current => {
+      const newWall = [...current.wall];
+      if (!current.players || current.players.length !== 4) return current;
+
+      const newPlayers = current.players.map(p => ({ ...p, hand: [] }));
+      
+      for (let i = 0; i < 4; i++) {
+        const pIndex = (current.dealerIndex + i) % 4;
+        if (newWall.length >= 4) {
+            const draw = newWall.splice(0, 4);
+            if (newPlayers[pIndex]) newPlayers[pIndex].hand = sortHand(draw);
+        }
+      }
+      if (newWall.length > 0) {
+          const dealerExtra = newWall.shift();
+          if (dealerExtra && newPlayers[current.dealerIndex]) {
+            newPlayers[current.dealerIndex].hand = sortHand([...newPlayers[current.dealerIndex].hand, dealerExtra]);
+          }
+      }
+
+      return {
+        ...current,
+        wall: newWall,
+        players: newPlayers,
+        phase: GamePhase.PLAYING,
+        turnIndex: current.dealerIndex,
+        logs: [...current.logs, "發牌完成，遊戲開始！"]
+      };
+    });
+    setWaitingReason('NONE');
+    setIsProcessing(false);
+  };
+
+  const calculateAndApplyScores = (winnerId: number, winningHand: TileData[], loserId: number | null) => {
+     setGame(current => {
+        if (!current.players[winnerId]) return current;
+        const newPlayers = [...current.players];
+        const winner = newPlayers[winnerId];
+        let payoutLogs: string[] = [];
+
+        const isHeavenly = (current.wall.length === 15) && (winnerId === current.dealerIndex) && (loserId === null);
+        const isFive = isFivePawns(winningHand);
+        let payAmount = 0;
+        if (isHeavenly) { payAmount = 50; payoutLogs.push(`🀄 起手倒 (天胡)！每家付 ${payAmount} 元`); } 
+        else if (isFive) { payAmount = 50; payoutLogs.push(`♟️ 五兵/五卒合手！支付 ${payAmount} 元`); } 
+        else { payAmount = loserId !== null ? 10 : 20; }
+
+        let nextDealer = 0;
+        if (loserId !== null) {
+            const loser = newPlayers[loserId];
+            if (loser) {
+                loser.chips -= payAmount;
+                winner.chips += payAmount;
+                payoutLogs.push(`${loser.name} 放槍！支付 ${payAmount} 元給 ${winner.name}`);
+                nextDealer = loserId;
+                payoutLogs.push(`下局莊家: ${loser.name} (放槍者)`);
+            }
+        } else {
+            newPlayers.forEach(p => {
+                if (p.id !== winnerId) { p.chips -= payAmount; winner.chips += payAmount; }
+            });
+            if (!isHeavenly && !isFive) payoutLogs.push(`自摸！其他三家各付 ${payAmount} 元`);
+            nextDealer = (winnerId + 1) % 4;
+            if (newPlayers[nextDealer]) payoutLogs.push(`下局莊家: ${newPlayers[nextDealer].name} (自摸者下家)`);
+        }
+        setNextRoundDealer(nextDealer);
+        return { ...current, players: newPlayers, logs: [...current.logs, ...payoutLogs] };
+     });
+     audioService.playWin();
+  };
+
+  const handleDefaultAction = () => {
+      if (!isHost) return;
+      performDraw(game.turnIndex);
+  };
+
+  const startTurnDecision = (nextPlayerIndex: number) => {
+      setGame(prev => ({ ...prev, turnIndex: nextPlayerIndex }));
+      setWaitingReason('TURN_DECISION');
+      setDecisionTimer(6); 
+      setIsProcessing(false); 
+  };
+
+  const performDraw = (playerIndex: number) => {
+    setWaitingReason('NONE');
+    setDecisionTimer(0);
+    setIsProcessing(false);
+    audioService.playDraw();
+
+    setGame(prev => {
+      if (prev.wall.length === 0) {
+        const nextDealer = (prev.dealerIndex + 1) % 4;
+        setNextRoundDealer(nextDealer);
+        const nextPlayerName = prev.players[nextDealer]?.name || "下一位";
+        return { ...prev, phase: GamePhase.GAME_OVER, logs: [...prev.logs, "流局！沒牌了。", `下局莊家: ${nextPlayerName}`] };
+      }
+      const p = prev.players[playerIndex];
+      if (!p) return prev;
+      if (p.hand.length >= 5) return prev;
+
+      const newWall = [...prev.wall];
+      const tile = newWall.shift()!;
+      const newPlayers = [...prev.players];
+      newPlayers[playerIndex] = { ...p, hand: sortHand([...p.hand, tile]) }; 
+      
+      return { ...prev, wall: newWall, players: newPlayers, logs: [...prev.logs, `${newPlayers[playerIndex].name} 摸了一張牌`] };
+    });
+  };
+
+  const handleEat = async (playerIndex: number) => {
+      if (!game.lastDiscard) return;
+      setWaitingReason('NONE');
+      setDecisionTimer(0);
+      setIsProcessing(true);
+      audioService.playClick();
+
+      setGame(prev => {
+          const p = prev.players[playerIndex];
+          if (!p) return prev;
+          const tile = prev.lastDiscard!;
+          const newHand = sortHand([...p.hand, tile]);
+          const discarderIndex = (playerIndex + 3) % 4;
+          const discarder = prev.players[discarderIndex];
+          if (!discarder) return prev;
+          const newDiscards = [...discarder.discards];
+          newDiscards.pop(); 
+          const newPlayers = [...prev.players];
+          newPlayers[playerIndex] = { ...p, hand: newHand };
+          newPlayers[discarderIndex] = { ...discarder, discards: newDiscards };
+          return { ...prev, players: newPlayers, lastDiscard: null, logs: [...prev.logs, `${p.name} 吃牌`] };
+      });
+      setTimeout(() => setIsProcessing(false), 300);
+  };
+
+  const handleDiscardProcess = async (playerId: number, tile: TileData) => {
+      audioService.playDiscard();
+      try {
+          setGame(prev => {
+              const p = prev.players[playerId];
+              if (!p) return prev;
+              const newHand = p.hand.filter(t => t.id !== tile.id);
+              const newDiscards = [...p.discards, tile];
+              const newPlayers = [...prev.players];
+              newPlayers[playerId] = { ...p, hand: newHand, discards: newDiscards };
+              return { ...prev, players: newPlayers, lastDiscard: tile, logs: [...prev.logs, `${p.name} 打出 ${tile.label}`] };
+          });
+
+          let winnerFound = -1;
+          if (game.players && game.players.length === 4) {
+              for (let i = 1; i <= 3; i++) {
+                  const checkIdx = (playerId + i) % 4;
+                  const playerToCheck = game.players[checkIdx]; 
+                  if (playerToCheck && checkWinWithTile(playerToCheck.hand, tile)) {
+                      winnerFound = checkIdx;
+                      break; 
+                  }
+              }
+          }
+
+          if (winnerFound !== -1) {
+              const winner = game.players[winnerFound];
+              if (winner && winner.isHuman) {
+                  setWinningTile(tile);
+                  setWaitingReason('HU');
+              } else if (winner) {
+                  handleGameWin(winnerFound, [...winner.hand, tile], playerId);
+              }
+              return;
+          }
+          startTurnDecision((playerId + 1) % 4);
+      } finally {
+          setSelectedTile(null);
+      }
+  };
+  
+  const handleGameWin = (winnerId: number, finalHand: TileData[], loserId: number | null) => {
+      if (!game.players[winnerId]) return;
+      setGame(prev => ({
+          ...prev,
+          winnerId,
+          loserId,
+          winningHand: finalHand,
+          phase: GamePhase.GAME_OVER,
+          logs: [...prev.logs, `${prev.players[winnerId].name} 胡牌！`]
+      }));
+      calculateAndApplyScores(winnerId, finalHand, loserId);
+  };
+
+  const executeBotDecision = (bot: Player) => {
+      if (!bot || !bot.hand) return;
+      const usefulToEat = game.lastDiscard && getChiCombinations(bot.hand, game.lastDiscard).length > 0;
+      if (usefulToEat && Math.random() > 0.5) {
+          handleEat(bot.id);
+      } else {
+          performDraw(bot.id);
+      }
+  };
+
+  const executeBotDiscardPhase = (bot: Player) => {
+      if (!bot || !bot.hand) return;
+      if (checkWin(bot.hand)) {
+          handleGameWin(bot.id, bot.hand, null);
+          return;
+      }
+      const discardTile = getBestDiscard(bot.hand);
+      handleDiscardProcess(bot.id, discardTile);
+  };
+
+  const handleHumanTileClick = (tile: TileData) => {
+      if (game.turnIndex !== myPlayerId) return;
+      if (game.phase !== GamePhase.PLAYING) return;
+      if (waitingReason !== 'NONE') return;
+      if (isProcessing) return;
+
+      if (selectedTile?.id === tile.id) {
+          setIsProcessing(true);
+          dispatchAction('ACTION_DISCARD', { tile });
+      } else {
+          setSelectedTile(tile);
+          audioService.playClick();
+      }
+  };
+  
+  const handleHumanWin = (winnerId: number) => {
+      if (waitingReason === 'HU' && winningTile) {
+          handleGameWin(winnerId, [...game.players[winnerId].hand, winningTile], game.turnIndex); 
+      } else if (game.turnIndex === winnerId && checkWin(game.players[winnerId].hand)) {
+          handleGameWin(winnerId, game.players[winnerId].hand, null);
+      }
+  };
+  
+  const handlePass = () => {
+      if (waitingReason === 'HU') {
+          setWaitingReason('NONE');
+          setWinningTile(null);
+          startTurnDecision((game.turnIndex + 1) % 4);
+      }
+  };
+
+
+  // --- View / Renders ---
+
+  const getPlayerAtView = (viewIdx: number) => (myPlayerId + viewIdx) % 4;
+
+  const renderPlayerHand = (player: Player, position: 'bottom' | 'right' | 'top' | 'left') => {
+    if (!player) return null;
+    const isSelf = player.id === myPlayerId;
+    const showFace = isSelf || game.phase === GamePhase.GAME_OVER;
+    const displayHand = isSelf ? sortHand(player.hand) : player.hand;
+
+    // SCALING FOR OPPONENTS (Mobile Optimization)
+    // Scale down opponents (0.6) and ensure origin is correct to push them to edges
+    const containerStyle = isSelf ? '' : 'scale-[0.6] origin-center';
+
+    return (
+      <div className={`flex ${isSelf ? 'gap-1' : '-space-x-3'} items-end justify-center ${containerStyle}`}>
+        {displayHand.map((tile, idx) => (
+          <Tile 
+            key={tile.id || idx} 
+            tile={tile} 
+            size={isSelf ? 'lg' : 'sm'} 
+            faceDown={!showFace} 
+            onClick={isSelf ? () => handleHumanTileClick(tile) : undefined}
+            selected={isSelf && selectedTile?.id === tile.id}
+            className={`transition-transform ${isSelf ? 'hover:-translate-y-2 hover:brightness-110' : ''}`}
+          />
+        ))}
+      </div>
+    );
+  };
+
+  const renderDiscardPile = (player: Player) => {
+      if (!player) return null;
+      // Updated: grid-cols-3 for compactness, w-auto to fit content
+      return (
+        <div className="grid grid-cols-3 gap-0.5 p-1 rounded-lg bg-black/40 border border-white/10 w-auto justify-items-center shadow-lg backdrop-blur-sm">
+            {player.discards.map((tile) => (
+                <Tile key={tile.id} tile={tile} size="sm" />
+            ))}
+        </div>
+      );
+  };
+
+  // Styles adapted for Rotation
+  const getPlayerStyle = (viewIndex: number) => {
+    switch (viewIndex) {
+        // Bottom: Self. Centered.
+        case 0: return { bottom: '100px', left: '50%', transform: 'translate(-50%, 0)', zIndex: 30 };
+        // Right: P1. Rotated. Moved to edge (right: -25px)
+        case 1: return { right: '-25px', top: '50%', transform: 'translate(0, -50%) rotate(-90deg)', zIndex: 30 };
+        // Top: P2. Centered. Moved to edge (top: 10px)
+        case 2: return { top: '10px', left: '50%', transform: 'translate(-50%, 0) rotate(180deg)', zIndex: 30 };
+        // Left: P3. Rotated. Moved to edge (left: -25px)
+        case 3: return { left: '-25px', top: '50%', transform: 'translate(0, -50%) rotate(90deg)', zIndex: 30 };
+        default: return {};
+    }
+  };
+  
+  const getDiscardStyle = (viewIndex: number) => {
+    // Reduced offset to 105px for tighter circle (Mobile safe)
+    const offset = 105; 
+    switch (viewIndex) {
+        // Bottom player's discard goes UP (+Y relative to center? No, translate(0, offset))
+        case 0: return { top: '50%', left: '50%', transform: `translate(-50%, -50%) translate(0, ${offset}px)`, zIndex: 20 };
+        case 1: return { top: '50%', left: '50%', transform: `translate(-50%, -50%) translate(${offset}px, 0) rotate(-90deg)`, zIndex: 20 };
+        case 2: return { top: '50%', left: '50%', transform: `translate(-50%, -50%) translate(0, -${offset}px) rotate(180deg)`, zIndex: 20 };
+        case 3: return { top: '50%', left: '50%', transform: `translate(-50%, -50%) translate(-${offset}px, 0) rotate(90deg)`, zIndex: 20 };
+        default: return {};
+    }
+  };
+
+  const getAvatarStyle = (viewIndex: number) => {
+    switch (viewIndex) {
+        case 0: return { bottom: '20px', left: '20px' };
+        case 1: return { bottom: '20px', right: '20px' };
+        case 2: return { top: '20px', right: '20px' };
+        case 3: return { top: '20px', left: '20px' };
+        default: return {};
+    }
+  };
+
+  const isMyTurn = game.turnIndex === myPlayerId;
+  const canDraw = waitingReason === 'TURN_DECISION' && isMyTurn;
+  const canDiscard = waitingReason === 'NONE' && isMyTurn && !isProcessing;
+  const isSessionOver = game.players.some(p => p.chips <= 0);
+  const canCut = game.phase === GamePhase.CUTTING && game.dealerIndex === myPlayerId;
+  const allPlayersReady = game.players.every(p => p.isReady);
+
+  if (showLobby) {
+      return (
+        <div className="w-full h-screen bg-[#1a472a] relative overflow-hidden text-white flex items-center justify-center">
+            <div className="absolute inset-0 felt-texture opacity-50 pointer-events-none"></div>
+            <div className="bg-black/80 p-8 rounded-2xl shadow-2xl text-center max-w-md w-full border border-amber-500/30 backdrop-blur-sm z-10">
+                <h1 className="text-4xl font-bold text-amber-400 mb-8 font-serif">四人車馬炮</h1>
+                
+                <div className="space-y-6">
+                    <button onClick={() => initGame(GameMode.SINGLEPLAYER, 0)}
+                        className="w-full py-4 bg-amber-700 hover:bg-amber-600 rounded-lg text-xl font-bold shadow-lg border-2 border-amber-500 transition-transform hover:scale-105"
+                    >
+                        單人挑戰 (vs 電腦)
+                    </button>
+
+                    <div className="border-t border-white/10 pt-4">
+                        <h3 className="text-gray-400 mb-4 text-sm">多人連線 (模擬)</h3>
+                        <div className="grid grid-cols-2 gap-4">
+                            <button onClick={() => initGame(GameMode.MULTIPLAYER, 0)}
+                                className="py-3 bg-blue-900 hover:bg-blue-800 rounded-lg font-bold border border-blue-500"
+                            >
+                                建立房間 (P0 房主)
+                            </button>
+                            {[1, 2, 3].map(id => (
+                                <button key={id} onClick={() => initGame(GameMode.MULTIPLAYER, id)}
+                                    className="py-3 bg-gray-800 hover:bg-gray-700 rounded-lg font-bold border border-gray-600"
+                                >
+                                    加入座位 (P{id})
+                                </button>
+                            ))}
+                        </div>
+                        <p className="text-xs text-gray-500 mt-4">
+                            * 請在同一瀏覽器的不同分頁開啟此頁面來測試連線。
+                        </p>
+                    </div>
+                </div>
+            </div>
+        </div>
+      );
+  }
+
+  if (game.phase === GamePhase.LOBBY) {
+      return (
+        <div className="w-full h-screen bg-[#1a472a] relative overflow-hidden text-white flex items-center justify-center">
+            <div className="absolute inset-0 felt-texture opacity-50 pointer-events-none"></div>
+            <div className="bg-black/80 p-8 rounded-2xl shadow-2xl w-full max-w-2xl border border-amber-500/30 backdrop-blur-sm z-10">
+                <h2 className="text-3xl font-bold text-amber-400 mb-6 text-center">準備室 (房間代號: DEMO)</h2>
+                
+                <div className="grid grid-cols-4 gap-4 mb-8">
+                    {game.players.map((p, i) => (
+                        <div key={i} className={`
+                            flex flex-col items-center p-4 rounded-lg border-2 
+                            ${p.isReady ? 'border-green-500 bg-green-900/20' : 'border-gray-600 bg-gray-800/20'}
+                        `}>
+                            <img src={AVATARS[i]} alt={p.name} className="w-16 h-16 rounded-full mb-2 object-cover"/>
+                            <div className="font-bold text-lg mb-1">{p.name}</div>
+                            <div className="text-xs text-gray-400 mb-2">{p.isHuman ? '玩家' : '電腦'}</div>
+                            {p.isReady 
+                                ? <span className="text-green-400 font-bold px-3 py-1 bg-green-900/50 rounded-full text-sm">已準備</span>
+                                : <span className="text-gray-400 font-bold px-3 py-1 bg-gray-700/50 rounded-full text-sm">等待中...</span>
+                            }
+                        </div>
+                    ))}
+                </div>
+
+                <div className="flex justify-center gap-4">
+                    {isHost ? (
+                        <button 
+                            onClick={startGame}
+                            disabled={!allPlayersReady}
+                            className={`px-8 py-3 rounded-lg font-bold text-xl shadow-lg transition-all
+                                ${allPlayersReady 
+                                    ? 'bg-amber-600 hover:bg-amber-500 text-white cursor-pointer hover:scale-105' 
+                                    : 'bg-gray-700 text-gray-500 cursor-not-allowed'}
+                            `}
+                        >
+                            {allPlayersReady ? '開始遊戲' : '等待玩家準備...'}
+                        </button>
+                    ) : (
+                        <button 
+                            onClick={() => dispatchAction('ACTION_TOGGLE_READY')}
+                            className={`px-8 py-3 rounded-lg font-bold text-xl shadow-lg transition-all border-2
+                                ${game.players[myPlayerId].isReady 
+                                    ? 'bg-red-600 hover:bg-red-500 border-red-400' 
+                                    : 'bg-green-600 hover:bg-green-500 border-green-400'}
+                            `}
+                        >
+                            {game.players[myPlayerId].isReady ? '取消準備' : '準備完成'}
+                        </button>
+                    )}
+                </div>
+                
+                <div className="text-center mt-6 text-gray-400 text-sm">
+                    {isHost ? "您是房主，請等待所有玩家準備完成後開始遊戲。" : "請點擊準備，等待房主開始遊戲。"}
+                </div>
+            </div>
+        </div>
+      );
+  }
+
+  return (
+    <div className="w-full h-screen bg-[#1a472a] relative overflow-hidden text-white select-none">
+      <div className="absolute inset-0 felt-texture opacity-50 pointer-events-none z-0"></div>
+      <div className="absolute inset-0 bg-black/20 pointer-events-none z-0" style={{background: 'radial-gradient(circle at center, transparent 0%, rgba(0,0,0,0.6) 100%)'}}></div>
+      
+      <button 
+        onClick={toggleMute}
+        className="absolute top-4 left-4 z-50 bg-black/40 p-2 rounded-full hover:bg-black/60 transition-colors border border-white/20"
+      >
+        {isMuted ? "🔇" : "🔊"}
+      </button>
+
+      <div className="absolute top-4 left-1/2 -translate-x-1/2 w-full max-w-xl pointer-events-none z-40 flex justify-center">
+         <div className="bg-black/30 rounded-full px-4 py-1 backdrop-blur-sm text-amber-400/80 text-sm font-bold border border-white/5 shadow-sm">
+            車馬炮 • {game.mode === GameMode.MULTIPLAYER ? `連線模式 (我是 P${myPlayerId})` : '單機'} • 籌碼戰
+         </div>
+      </div>
+      
+      <div className="absolute top-14 right-2 w-32 max-h-24 overflow-y-auto bg-black/30 rounded-lg p-1 text-[10px] pointer-events-auto backdrop-blur-sm z-40 border border-white/10 scrollbar-hide">
+          {game.logs.map((log, i) => (
+            <div key={i} className="mb-0.5 opacity-90 truncate">{log}</div>
+          ))}
+          <div ref={logsEndRef} />
+      </div>
+
+      <div className="absolute inset-0 z-10">
+        <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-10">
+            <Wall 
+                tiles={game.wall} 
+                startBreakIndex={game.wallBreakIndex} 
+                onCut={(idx) => dispatchAction('ACTION_CUT', { index: idx })}
+                canCut={canCut}
+                cutIndex={game.phase === GamePhase.DEALING ? game.wallBreakIndex : null}
+            />
+        </div>
+
+        {[0, 1, 2, 3].map(viewIndex => {
+            const playerId = getPlayerAtView(viewIndex);
+            const player = game.players[playerId];
+            return (
+                <React.Fragment key={playerId}>
+                    <div className="absolute origin-center" style={getDiscardStyle(viewIndex)}>
+                        {renderDiscardPile(player)}
+                    </div>
+                    <div className="absolute origin-center" style={getPlayerStyle(viewIndex)}>
+                         {renderPlayerHand(player, viewIndex === 0 ? 'bottom' : viewIndex === 1 ? 'right' : viewIndex === 2 ? 'top' : 'left')}
+                    </div>
+                    <div className="absolute z-30 flex flex-col items-center gap-1" style={getAvatarStyle(viewIndex)}>
+                        <div className={`relative w-12 h-12 rounded-full border-2 overflow-hidden shadow-lg bg-gray-800
+                            ${game.turnIndex === playerId ? 'border-yellow-400 ring-4 ring-yellow-400/30' : 'border-white/20'}
+                        `}>
+                            <img src={AVATARS[playerId]} alt={player?.name} className="w-full h-full object-cover" />
+                            {game.dealerIndex === playerId && (
+                                <div className="absolute bottom-0 right-0 bg-red-600 text-[10px] px-1 rounded-tl-md font-bold">莊</div>
+                            )}
+                        </div>
+                        <div className="bg-black/60 px-2 py-0.5 rounded text-xs backdrop-blur-sm text-center min-w-[60px]">
+                            <div className="text-amber-200 font-bold truncate max-w-[80px]">
+                                {playerId === myPlayerId ? '我' : player?.name}
+                            </div>
+                            <div className="text-green-300">${player?.chips}</div>
+                        </div>
+                        {game.turnIndex === playerId && decisionTimer > 0 && (
+                        <div className="h-1 w-full bg-gray-700 rounded-full overflow-hidden mt-1">
+                            <div className="h-full bg-yellow-400 transition-all duration-1000 ease-linear" style={{width: `${(decisionTimer/6)*100}%`}}></div>
+                        </div>
+                        )}
+                    </div>
+                </React.Fragment>
+            );
+        })}
+      </div>
+
+      {winningTile && (
+          <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-50 animate-bounce">
+              <div className="bg-red-600/90 text-white px-4 py-2 rounded-full shadow-xl text-lg font-bold flex items-center gap-2 backdrop-blur-sm border border-red-400">
+                  <span>有人胡這張!</span>
+                  <Tile tile={winningTile} size="sm" />
+              </div>
+          </div>
+      )}
+
+      <div className="absolute bottom-0 left-0 w-full p-6 flex justify-center gap-4 z-50 pointer-events-none">
+        <div className="pointer-events-auto flex gap-4 items-end pb-4">
+            {canDraw && (
+                <>
+                    <button 
+                        onClick={() => dispatchAction('ACTION_DRAW')}
+                        className="bg-blue-600 hover:bg-blue-500 text-white px-8 py-3 rounded-full shadow-lg font-bold text-lg border-2 border-blue-400 hover:scale-105 active:scale-95 transition-transform"
+                    >
+                        摸牌 ({decisionTimer}s)
+                    </button>
+                    {game.lastDiscard && (
+                        <button 
+                            onClick={() => dispatchAction('ACTION_EAT')}
+                            className="bg-emerald-600 hover:bg-emerald-500 text-white px-8 py-3 rounded-full shadow-lg font-bold text-lg border-2 border-emerald-400 hover:scale-105 active:scale-95 transition-transform"
+                        >
+                            吃牌
+                        </button>
+                    )}
+                </>
+            )}
+
+            {canDiscard && (
+                 <div className="flex items-center gap-4 bg-black/40 p-2 rounded-full backdrop-blur-sm border border-white/10">
+                    <div className="text-white/80 px-4">
+                        {selectedTile ? `已選: ${selectedTile.label}` : "請選一張牌打出"}
+                    </div>
+                    <button 
+                        disabled={!selectedTile}
+                        onClick={() => selectedTile && dispatchAction('ACTION_DISCARD', { tile: selectedTile })}
+                        className={`
+                            px-8 py-3 rounded-full shadow-lg font-bold text-lg transition-all border-2
+                            ${selectedTile 
+                                ? 'bg-amber-600 hover:bg-amber-500 border-amber-400 scale-100 cursor-pointer' 
+                                : 'bg-gray-600/50 border-gray-500/30 text-gray-400 scale-95 cursor-not-allowed'}
+                        `}
+                    >
+                        打出
+                    </button>
+                 </div>
+            )}
+            
+            {waitingReason === 'HU' && game.players[myPlayerId].isHuman && (
+                winningTile && checkWinWithTile(game.players[myPlayerId].hand, winningTile) && 
+                <div className="flex gap-4 animate-pulse">
+                    <button 
+                        onClick={() => dispatchAction('ACTION_WIN')}
+                        className="bg-red-600 hover:bg-red-500 text-white px-8 py-3 rounded-full shadow-xl font-bold text-2xl border-2 border-red-300"
+                    >
+                        胡牌!
+                    </button>
+                    <button 
+                        onClick={() => dispatchAction('ACTION_PASS')}
+                        className="bg-gray-600 hover:bg-gray-500 text-white px-6 py-3 rounded-full shadow-lg font-bold text-lg border-2 border-gray-400"
+                    >
+                        過
+                    </button>
+                </div>
+            )}
+
+            {canDiscard && checkWin(game.players[myPlayerId].hand) && (
+                 <button 
+                    onClick={() => dispatchAction('ACTION_WIN')}
+                    className="bg-red-600 hover:bg-red-500 text-white px-8 py-3 rounded-full shadow-xl font-bold text-2xl border-2 border-red-300 ml-4"
+                >
+                    自摸!
+                </button>
+            )}
+        </div>
+      </div>
+      
+      {isProcessing && (
+          <div className="absolute top-20 left-1/2 -translate-x-1/2 z-50">
+             <div className="bg-black/60 text-white px-4 py-1 rounded-full text-sm flex items-center gap-2 backdrop-blur-md">
+                 <div className="w-3 h-3 rounded-full border-2 border-t-transparent border-white animate-spin"></div>
+                 {isHost ? '電腦思考中...' : '等待房主回應...'}
+             </div>
+          </div>
+      )}
+
+      {game.phase === GamePhase.GAME_OVER && (
+        <div className="absolute inset-0 bg-black/85 flex items-center justify-center z-50 backdrop-blur-md p-4">
+          <div className="bg-[#1a472a] p-6 md:p-8 rounded-2xl shadow-2xl border-2 border-amber-500/50 text-center max-w-lg w-full relative overflow-hidden">
+            <div className="absolute top-0 left-0 w-full h-2 bg-gradient-to-r from-amber-600 via-yellow-400 to-amber-600"></div>
+            <h2 className="text-2xl md:text-3xl font-bold text-amber-400 mb-2">
+                {game.winnerId !== null && game.players[game.winnerId] ? (
+                    game.loserId !== null && game.players[game.loserId]
+                    ? <span>{game.players[game.winnerId].name} 胡牌 (放槍: {game.players[game.loserId].name})</span>
+                    : <span>{game.players[game.winnerId].name} 自摸!</span>
+                ) : '本局流局'}
+            </h2>
+            <div className="text-gray-400 text-sm mb-6">
+                {isSessionOver ? "遊戲結束" : "結算完成"}
+            </div>
+
+            {game.winningHand && (
+                <div className="mb-6 p-4 bg-black/20 rounded-xl inline-block">
+                    <div className="flex gap-2 justify-center flex-wrap">
+                        {game.winningHand.map((t, i) => <Tile key={i} tile={t} size="md" />)}
+                    </div>
+                </div>
+            )}
+
+            <div className="space-y-2 mb-8 text-left bg-black/20 p-4 rounded-lg">
+                 {game.players.map(p => (
+                     <div key={p.id} className="flex justify-between items-center border-b border-white/5 pb-1 last:border-0">
+                         <span className={p.id === game.winnerId ? 'text-yellow-400 font-bold' : 'text-gray-300'}>
+                             {p.name} {p.id === game.dealerIndex ? '(莊)' : ''}
+                         </span>
+                         <span className={`font-mono ${p.chips <= 0 ? 'text-red-500 font-bold' : 'text-green-300'}`}>
+                             ${p.chips}
+                         </span>
+                     </div>
+                 ))}
+            </div>
+
+            {isHost ? (
+                <button 
+                    onClick={isSessionOver ? () => dispatchAction('RESTART', { reset: true }) : () => dispatchAction('RESTART', { reset: false })}
+                    className={`text-white text-xl font-bold py-3 px-10 rounded-full shadow-lg border-2 ${isSessionOver ? 'bg-red-600 border-red-400' : 'bg-amber-600 border-amber-400'}`}
+                >
+                    {isSessionOver ? '重新開始' : '下一局'}
+                </button>
+            ) : (
+                <div className="text-amber-500 animate-pulse">等待房主開始下一局...</div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+export default App;
