@@ -48,6 +48,7 @@ export enum GameMode {
 export interface GameState {
   mode: GameMode;
   phase: GamePhase;
+  playerCount: number; // 2, 3, or 4
   turnIndex: number; 
   dealerIndex: number;
   wall: TileData[]; 
@@ -62,6 +63,8 @@ export interface GameState {
 
 // Network Actions
 export type NetworkActionType = 
+  | 'REQUEST_JOIN'  // Client asking to join
+  | 'ASSIGN_ID'     // Host assigning Player ID
   | 'JOIN' 
   | 'SYNC_STATE' 
   | 'ACTION_DRAW' 
@@ -76,5 +79,5 @@ export type NetworkActionType =
 export interface NetworkMessage {
   type: NetworkActionType;
   payload?: any;
-  senderId?: number;
+  senderId?: number; // Player ID
 }

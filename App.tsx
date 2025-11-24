@@ -1,5 +1,4 @@
-
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { 
   GamePhase, 
   GameState, 
@@ -33,6 +32,7 @@ const App: React.FC = () => {
   const [game, setGame] = useState<GameState>({
     mode: GameMode.SINGLEPLAYER,
     phase: GamePhase.LOBBY,
+    playerCount: 4,
     turnIndex: 0,
     dealerIndex: 0,
     wall: [],
@@ -42,13 +42,18 @@ const App: React.FC = () => {
     winnerId: null,
     loserId: null,
     winningHand: null,
-    logs: ["歡迎來到四人車馬炮！"],
+    logs: ["歡迎來到車馬炮！"],
   });
 
   // Multiplayer State
-  const [myPlayerId, setMyPlayerId] = useState<number>(0); // Default 0 (Host/Self)
-  const [isHost, setIsHost] = useState<boolean>(true); // Default True (Singleplayer)
+  const [myPlayerId, setMyPlayerId] = useState<number>(0); 
+  const [isHost, setIsHost] = useState<boolean>(true);
   const [showLobby, setShowLobby] = useState(true);
+  const [roomId, setRoomId] = useState<string>(""); 
+  const [joinInput, setJoinInput] = useState<string>("");
+  const [isConnecting, setIsConnecting] = useState(false);
+  const [copySuccess, setCopySuccess] = useState("");
+  const [selectedPlayerCount, setSelectedPlayerCount] = useState<number>(4);
 
   const [isProcessing, setIsProcessing] = useState(false); 
   const [winningTile, setWinningTile] = useState<TileData | null>(null); 
@@ -63,14 +68,15 @@ const App: React.FC = () => {
 
   // --- Initialization ---
 
-  const initGame = (mode: GameMode, myId: number) => {
+  const initGame = (mode: GameMode, myId: number, count: number) => {
     audioService.playBGM();
     const isMultiplayer = mode === GameMode.MULTIPLAYER;
     const host = isMultiplayer ? myId === 0 : true;
 
-    const players: Player[] = Array.from({ length: 4 }).map((_, i) => ({
+    // Create Players array of length 'count'
+    const players: Player[] = Array.from({ length: count }).map((_, i) => ({
       id: i,
-      name: PLAYER_NAMES[i],
+      name: PLAYER_NAMES[i] || `玩家 ${i}`,
       isHuman: isMultiplayer ? (i === myId) : (i === 0), 
       isReady: !isMultiplayer || (host && i === 0) || (i !== 0 && i !== myId), 
       hand: [],
@@ -78,15 +84,22 @@ const App: React.FC = () => {
       chips: 100 
     }));
     
+    // For multiplayer host, initialize others as not ready
+    if (isMultiplayer && host) {
+        players.forEach((p, i) => { if (i !== 0) p.name = "等待加入..."; });
+    }
+    
+    // For multiplayer client, set self as not ready
     if (isMultiplayer && !host) {
-        players[myId].isReady = false;
+        if(players[myId]) players[myId].isReady = false;
     }
 
-    const randomStarter = Math.floor(Math.random() * 4);
+    const randomStarter = Math.floor(Math.random() * count);
 
     setGame({
       mode,
       phase: GamePhase.LOBBY,
+      playerCount: count,
       turnIndex: 0,
       dealerIndex: 0,
       wall: [],
@@ -96,7 +109,7 @@ const App: React.FC = () => {
       winnerId: null,
       loserId: null,
       winningHand: null,
-      logs: [`模式: ${isMultiplayer ? '多人連線' : '單機'}`, `我是玩家: ${myId} (${host ? '房主' : '參加者'})`],
+      logs: [`模式: ${isMultiplayer ? '多人連線' : '單機'} (${count}人)`, `我是玩家: ${myId}`],
     });
 
     setNextRoundDealer(randomStarter);
@@ -109,9 +122,7 @@ const App: React.FC = () => {
     setSelectedTile(null);
     setDecisionTimer(0);
 
-    if (isMultiplayer && !host) {
-        multiplayerService.send('JOIN', { name: `玩家 ${myId}` }, myId);
-    }
+    // Client handshake is handled in joinRoom
   };
 
   const toggleMute = () => {
@@ -119,65 +130,112 @@ const App: React.FC = () => {
       setIsMuted(muted);
   };
 
+  // --- Multiplayer Setup (PeerJS) ---
+
+  const createRoom = async () => {
+      setIsConnecting(true);
+      try {
+          const id = await multiplayerService.init();
+          setRoomId(id);
+          initGame(GameMode.MULTIPLAYER, 0, selectedPlayerCount);
+          
+          // Setup Host Handshake
+          multiplayerService.setHostMessageHandler((msg, peerId) => {
+              if (msg.type === 'REQUEST_JOIN') {
+                  handleJoinRequest(msg.payload.name, peerId);
+              }
+          });
+
+      } catch (e) {
+          console.error(e);
+          alert("建立房間失敗 (PeerJS Error)");
+      } finally {
+          setIsConnecting(false);
+      }
+  };
+
+  const joinRoom = async () => {
+      if (!joinInput) return;
+      setIsConnecting(true);
+      try {
+          await multiplayerService.init();
+          await multiplayerService.connectToHost(joinInput);
+          setIsHost(false);
+          
+          // Send Request to Host
+          multiplayerService.send('REQUEST_JOIN', { name: "玩家" });
+          
+          audioService.playBGM();
+          setGame(prev => ({ ...prev, logs: ["正在連線到房間..."] }));
+          setShowLobby(false);
+          
+      } catch (e) {
+          console.error(e);
+          alert("加入失敗: ID錯誤或無法連線");
+          setShowLobby(true);
+      } finally {
+          setIsConnecting(false);
+      }
+  };
+
+  const handleJoinRequest = (name: string, peerId: string) => {
+      setGame(prev => {
+          const newPlayers = [...prev.players];
+          // Find first empty slot (not human, not P0)
+          const emptyIndex = newPlayers.findIndex((p, i) => i !== 0 && !p.isHuman);
+          
+          if (emptyIndex !== -1) {
+              newPlayers[emptyIndex] = {
+                  ...newPlayers[emptyIndex],
+                  name: `玩家 ${emptyIndex}`,
+                  isHuman: true,
+                  isReady: false
+              };
+              
+              // Reply to Client
+              multiplayerService.sendToPeer(peerId, 'ASSIGN_ID', { id: emptyIndex });
+              
+              // Broadcast update
+              setTimeout(() => broadcastState(newPlayers), 100);
+              
+              return { ...prev, players: newPlayers, logs: [...prev.logs, `玩家 ${emptyIndex} 加入連線`] };
+          }
+          return prev;
+      });
+  };
+
   // --- Network Listeners ---
 
   useEffect(() => {
     multiplayerService.setOnMessage((msg: NetworkMessage) => {
         if (isHost) {
+            // Host handling actions from clients
             switch(msg.type) {
-                case 'JOIN':
-                    const joinerId = msg.senderId;
-                    if (joinerId !== undefined) {
-                        setGame(prev => {
-                            const newPlayers = [...prev.players];
-                            if (newPlayers[joinerId]) {
-                                newPlayers[joinerId].isHuman = true;
-                                newPlayers[joinerId].isReady = false;
-                                return { ...prev, players: newPlayers, logs: [...prev.logs, `玩家 ${joinerId} 已加入連線`] };
-                            }
-                            return prev;
-                        });
-                    }
-                    break;
                 case 'ACTION_TOGGLE_READY':
-                    if (msg.senderId !== undefined) {
-                        setGame(prev => {
-                            const newPlayers = [...prev.players];
-                            if (newPlayers[msg.senderId!]) {
-                                newPlayers[msg.senderId!].isReady = !newPlayers[msg.senderId!].isReady;
-                            }
-                            return { ...prev, players: newPlayers };
-                        });
-                        audioService.playClick();
-                    }
-                    break;
                 case 'ACTION_DRAW':
-                    if (msg.senderId !== undefined) performDraw(msg.senderId);
-                    break;
                 case 'ACTION_DISCARD':
-                    if (msg.senderId !== undefined && msg.payload.tile) handleDiscardProcess(msg.senderId, msg.payload.tile);
-                    break;
                 case 'ACTION_EAT':
-                    if (msg.senderId !== undefined) handleEat(msg.senderId);
-                    break;
                 case 'ACTION_WIN':
-                    if (msg.senderId !== undefined) handleHumanWin(msg.senderId);
-                    break;
                 case 'ACTION_PASS':
-                    handlePass();
-                    break;
                 case 'ACTION_CUT':
-                    if (msg.payload.index !== undefined) handleCutWall(msg.payload.index);
-                    break;
-                case 'RESTART':
+                     if (msg.senderId !== undefined) {
+                         dispatchAction(msg.type, msg.payload, msg.senderId);
+                     }
                      break;
             }
         } else {
-            if (msg.type === 'SYNC_STATE') {
+            // Client receiving updates
+            if (msg.type === 'ASSIGN_ID') {
+                const myId = msg.payload.id;
+                setMyPlayerId(myId);
+                // Initialize local game state placeholder until sync
+                initGame(GameMode.MULTIPLAYER, myId, 4); // Count will be overwritten by sync
+            }
+            else if (msg.type === 'SYNC_STATE') {
                 const serverState = msg.payload;
                 setGame(prev => ({
                     ...serverState,
-                    mode: prev.mode
+                    mode: GameMode.MULTIPLAYER
                 }));
                 if (msg.payload.aux) {
                     setIsProcessing(msg.payload.aux.isProcessing);
@@ -188,13 +246,14 @@ const App: React.FC = () => {
             }
         }
     });
-  }, [isHost, myPlayerId, game.players]); 
+  }, [isHost]); 
 
-  // --- State Broadcasting (Host Only) ---
-  useEffect(() => {
+  // --- Broadcast (Host) ---
+  const broadcastState = (playersOverride?: Player[]) => {
       if (isHost && game.mode === GameMode.MULTIPLAYER) {
           multiplayerService.send('SYNC_STATE', {
               ...game,
+              players: playersOverride || game.players,
               aux: {
                   isProcessing,
                   waitingReason,
@@ -203,10 +262,14 @@ const App: React.FC = () => {
               }
           });
       }
+  };
+
+  useEffect(() => {
+      broadcastState();
   }, [game, isProcessing, waitingReason, winningTile, decisionTimer, isHost]);
 
 
-  // --- Game Logic Hooks (Host Only) ---
+  // --- Game Loop (Host Only) ---
 
   useEffect(() => {
     logsEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -253,26 +316,31 @@ const App: React.FC = () => {
   }, [waitingReason, decisionTimer, isHost]);
 
 
-  // --- Actions Dispatcher ---
+  // --- Action Dispatcher ---
 
-  const dispatchAction = (type: NetworkActionType, payload: any = {}) => {
-      audioService.playClick();
+  const dispatchAction = (type: NetworkActionType, payload: any = {}, senderOverride?: number) => {
+      const sender = senderOverride !== undefined ? senderOverride : myPlayerId;
+      
       if (isHost) {
+          audioService.playClick();
           switch(type) {
-              case 'ACTION_DRAW': performDraw(myPlayerId); break;
-              case 'ACTION_DISCARD': if(payload.tile) handleDiscardProcess(myPlayerId, payload.tile); break;
-              case 'ACTION_EAT': handleEat(myPlayerId); break;
-              case 'ACTION_WIN': handleHumanWin(myPlayerId); break;
+              case 'ACTION_DRAW': performDraw(sender); break;
+              case 'ACTION_DISCARD': if(payload.tile) handleDiscardProcess(sender, payload.tile); break;
+              case 'ACTION_EAT': handleEat(sender); break;
+              case 'ACTION_WIN': handleHumanWin(sender); break;
               case 'ACTION_PASS': handlePass(); break;
               case 'ACTION_CUT': if(payload.index !== undefined) handleCutWall(payload.index); break;
               case 'ACTION_TOGGLE_READY': 
                  setGame(prev => {
                      const ps = [...prev.players];
-                     if(ps[myPlayerId]) ps[myPlayerId].isReady = !ps[myPlayerId].isReady;
+                     if(ps[sender]) ps[sender].isReady = !ps[sender].isReady;
                      return {...prev, players: ps};
                  });
                  break;
-              case 'RESTART': if(payload.reset) initGame(game.mode, myPlayerId); else startGame(); break;
+              case 'RESTART': 
+                 if(payload.reset) initGame(game.mode, myPlayerId, game.playerCount); 
+                 else startGame(); 
+                 break;
           }
       } else {
           multiplayerService.send(type, payload, myPlayerId);
@@ -280,15 +348,9 @@ const App: React.FC = () => {
   };
 
 
-  // --- Core Logic Functions (Host State Modifiers) ---
-
-  const addLog = (msg: string) => {
-    setGame(prev => ({ ...prev, logs: [...prev.logs, msg] }));
-  };
+  // --- Logic Methods (Host State Modifiers) ---
 
   const startGame = () => {
-    if (!isHost) { dispatchAction('RESTART', { reset: false }); return; }
-
     const deck = shuffleDeck(generateDeck());
     const starter = nextRoundDealer;
     
@@ -345,17 +407,20 @@ const App: React.FC = () => {
   const dealTiles = (startIndex: number) => {
     setGame(current => {
       const newWall = [...current.wall];
-      if (!current.players || current.players.length !== 4) return current;
+      const count = current.players.length;
+      if (!current.players || count === 0) return current;
 
       const newPlayers = current.players.map(p => ({ ...p, hand: [] }));
       
-      for (let i = 0; i < 4; i++) {
-        const pIndex = (current.dealerIndex + i) % 4;
+      // Deal 4 cards to everyone
+      for (let i = 0; i < count; i++) {
+        const pIndex = (current.dealerIndex + i) % count;
         if (newWall.length >= 4) {
             const draw = newWall.splice(0, 4);
             if (newPlayers[pIndex]) newPlayers[pIndex].hand = sortHand(draw);
         }
       }
+      // Dealer extra card
       if (newWall.length > 0) {
           const dealerExtra = newWall.shift();
           if (dealerExtra && newPlayers[current.dealerIndex]) {
@@ -382,6 +447,7 @@ const App: React.FC = () => {
         const newPlayers = [...current.players];
         const winner = newPlayers[winnerId];
         let payoutLogs: string[] = [];
+        const count = current.players.length;
 
         const isHeavenly = (current.wall.length === 15) && (winnerId === current.dealerIndex) && (loserId === null);
         const isFive = isFivePawns(winningHand);
@@ -404,8 +470,8 @@ const App: React.FC = () => {
             newPlayers.forEach(p => {
                 if (p.id !== winnerId) { p.chips -= payAmount; winner.chips += payAmount; }
             });
-            if (!isHeavenly && !isFive) payoutLogs.push(`自摸！其他三家各付 ${payAmount} 元`);
-            nextDealer = (winnerId + 1) % 4;
+            if (!isHeavenly && !isFive) payoutLogs.push(`自摸！其他家各付 ${payAmount} 元`);
+            nextDealer = (winnerId + 1) % count;
             if (newPlayers[nextDealer]) payoutLogs.push(`下局莊家: ${newPlayers[nextDealer].name} (自摸者下家)`);
         }
         setNextRoundDealer(nextDealer);
@@ -422,7 +488,7 @@ const App: React.FC = () => {
   const startTurnDecision = (nextPlayerIndex: number) => {
       setGame(prev => ({ ...prev, turnIndex: nextPlayerIndex }));
       setWaitingReason('TURN_DECISION');
-      setDecisionTimer(6); 
+      setDecisionTimer(10); // Changed to 10 seconds
       setIsProcessing(false); 
   };
 
@@ -433,8 +499,9 @@ const App: React.FC = () => {
     audioService.playDraw();
 
     setGame(prev => {
+      const count = prev.players.length;
       if (prev.wall.length === 0) {
-        const nextDealer = (prev.dealerIndex + 1) % 4;
+        const nextDealer = (prev.dealerIndex + 1) % count;
         setNextRoundDealer(nextDealer);
         const nextPlayerName = prev.players[nextDealer]?.name || "下一位";
         return { ...prev, phase: GamePhase.GAME_OVER, logs: [...prev.logs, "流局！沒牌了。", `下局莊家: ${nextPlayerName}`] };
@@ -453,6 +520,9 @@ const App: React.FC = () => {
   };
 
   const handleEat = async (playerIndex: number) => {
+      // 2 Player Rule: Cannot Eat
+      if (game.playerCount === 2) return;
+
       if (!game.lastDiscard) return;
       setWaitingReason('NONE');
       setDecisionTimer(0);
@@ -464,14 +534,30 @@ const App: React.FC = () => {
           if (!p) return prev;
           const tile = prev.lastDiscard!;
           const newHand = sortHand([...p.hand, tile]);
-          const discarderIndex = (playerIndex + 3) % 4;
+          
+          // Identify discarder
+          const count = prev.players.length;
+          // In standard logic, discarder is previous turn. 
+          // Reverse: (current - 1 + count) % count? No, last turn was turnIndex before this decision phase.
+          // Since we are IN decision phase, turnIndex is already the person who MIGHT draw.
+          // But wait, "Eat" steals the turn. The person Eating MUST be (Discarder + 1) % count in standard MJ,
+          // but here "Any player can Eat"? The rule was "Unconditional Eat".
+          // If we assume standard play flow where discarder is (turnIndex - 1), 
+          // we need to find who discarded 'lastDiscard'.
+          
+          // Simplified: We assume Discarder is (turnIndex + count - 1) % count.
+          const discarderIndex = (playerIndex + count - 1) % count;
           const discarder = prev.players[discarderIndex];
-          if (!discarder) return prev;
+          
+          if (!discarder) return prev; // Safety
+          
           const newDiscards = [...discarder.discards];
-          newDiscards.pop(); 
+          newDiscards.pop(); // Remove from table
+          
           const newPlayers = [...prev.players];
           newPlayers[playerIndex] = { ...p, hand: newHand };
           newPlayers[discarderIndex] = { ...discarder, discards: newDiscards };
+          
           return { ...prev, players: newPlayers, lastDiscard: null, logs: [...prev.logs, `${p.name} 吃牌`] };
       });
       setTimeout(() => setIsProcessing(false), 300);
@@ -491,14 +577,15 @@ const App: React.FC = () => {
           });
 
           let winnerFound = -1;
-          if (game.players && game.players.length === 4) {
-              for (let i = 1; i <= 3; i++) {
-                  const checkIdx = (playerId + i) % 4;
-                  const playerToCheck = game.players[checkIdx]; 
-                  if (playerToCheck && checkWinWithTile(playerToCheck.hand, tile)) {
-                      winnerFound = checkIdx;
-                      break; 
-                  }
+          const count = game.players.length;
+          
+          // Check other players for Win
+          for (let i = 1; i < count; i++) {
+              const checkIdx = (playerId + i) % count;
+              const playerToCheck = game.players[checkIdx]; 
+              if (playerToCheck && checkWinWithTile(playerToCheck.hand, tile)) {
+                  winnerFound = checkIdx;
+                  break; 
               }
           }
 
@@ -512,7 +599,7 @@ const App: React.FC = () => {
               }
               return;
           }
-          startTurnDecision((playerId + 1) % 4);
+          startTurnDecision((playerId + 1) % count);
       } finally {
           setSelectedTile(null);
       }
@@ -533,7 +620,10 @@ const App: React.FC = () => {
 
   const executeBotDecision = (bot: Player) => {
       if (!bot || !bot.hand) return;
-      const usefulToEat = game.lastDiscard && getChiCombinations(bot.hand, game.lastDiscard).length > 0;
+      
+      const canEatRule = game.playerCount !== 2;
+      const usefulToEat = canEatRule && game.lastDiscard && getChiCombinations(bot.hand, game.lastDiscard).length > 0;
+      
       if (usefulToEat && Math.random() > 0.5) {
           handleEat(bot.id);
       } else {
@@ -578,23 +668,43 @@ const App: React.FC = () => {
       if (waitingReason === 'HU') {
           setWaitingReason('NONE');
           setWinningTile(null);
-          startTurnDecision((game.turnIndex + 1) % 4);
+          startTurnDecision((game.turnIndex + 1) % game.players.length);
       }
   };
 
+  const copyRoomId = () => {
+      navigator.clipboard.writeText(roomId).then(() => {
+          setCopySuccess("已複製!");
+          setTimeout(() => setCopySuccess(""), 2000);
+      });
+  };
 
-  // --- View / Renders ---
 
-  const getPlayerAtView = (viewIdx: number) => (myPlayerId + viewIdx) % 4;
+  // --- View Rendering Logic ---
 
-  const renderPlayerHand = (player: Player, position: 'bottom' | 'right' | 'top' | 'left') => {
+  // Dynamic Position Mapping
+  // Returns standard position index (0:Bottom, 1:Right, 2:Top, 3:Left) based on relative index
+  const getRelativePosition = (playerId: number, myId: number, totalPlayers: number) => {
+      // Calculate relative index from self (0 to total-1)
+      let rel = (playerId - myId + totalPlayers) % totalPlayers;
+      
+      if (totalPlayers === 2) {
+          // 2 Players: 0->Bottom, 1->Top
+          return rel === 0 ? 0 : 2;
+      }
+      if (totalPlayers === 3) {
+          // 3 Players: 0->Bottom, 1->Right, 2->Left
+          return rel === 0 ? 0 : (rel === 1 ? 1 : 3);
+      }
+      // 4 Players: Standard rotation
+      return rel;
+  };
+
+  const renderPlayerHand = (player: Player, viewPosIndex: number) => {
     if (!player) return null;
     const isSelf = player.id === myPlayerId;
     const showFace = isSelf || game.phase === GamePhase.GAME_OVER;
     const displayHand = isSelf ? sortHand(player.hand) : player.hand;
-
-    // SCALING FOR OPPONENTS (Mobile Optimization)
-    // Scale down opponents (0.6) and ensure origin is correct to push them to edges
     const containerStyle = isSelf ? '' : 'scale-[0.6] origin-center';
 
     return (
@@ -616,7 +726,6 @@ const App: React.FC = () => {
 
   const renderDiscardPile = (player: Player) => {
       if (!player) return null;
-      // Updated: grid-cols-3 for compactness, w-auto to fit content
       return (
         <div className="grid grid-cols-3 gap-0.5 p-1 rounded-lg bg-black/40 border border-white/10 w-auto justify-items-center shadow-lg backdrop-blur-sm">
             {player.discards.map((tile) => (
@@ -626,26 +735,20 @@ const App: React.FC = () => {
       );
   };
 
-  // Styles adapted for Rotation
-  const getPlayerStyle = (viewIndex: number) => {
-    switch (viewIndex) {
-        // Bottom: Self. Centered.
+  // Styles based on 0(Bot), 1(Right), 2(Top), 3(Left)
+  const getPlayerStyle = (stdPos: number) => {
+    switch (stdPos) {
         case 0: return { bottom: '100px', left: '50%', transform: 'translate(-50%, 0)', zIndex: 30 };
-        // Right: P1. Rotated. Moved to edge (right: -25px)
         case 1: return { right: '-25px', top: '50%', transform: 'translate(0, -50%) rotate(-90deg)', zIndex: 30 };
-        // Top: P2. Centered. Moved to edge (top: 10px)
         case 2: return { top: '10px', left: '50%', transform: 'translate(-50%, 0) rotate(180deg)', zIndex: 30 };
-        // Left: P3. Rotated. Moved to edge (left: -25px)
         case 3: return { left: '-25px', top: '50%', transform: 'translate(0, -50%) rotate(90deg)', zIndex: 30 };
         default: return {};
     }
   };
   
-  const getDiscardStyle = (viewIndex: number) => {
-    // Reduced offset to 105px for tighter circle (Mobile safe)
+  const getDiscardStyle = (stdPos: number) => {
     const offset = 105; 
-    switch (viewIndex) {
-        // Bottom player's discard goes UP (+Y relative to center? No, translate(0, offset))
+    switch (stdPos) {
         case 0: return { top: '50%', left: '50%', transform: `translate(-50%, -50%) translate(0, ${offset}px)`, zIndex: 20 };
         case 1: return { top: '50%', left: '50%', transform: `translate(-50%, -50%) translate(${offset}px, 0) rotate(-90deg)`, zIndex: 20 };
         case 2: return { top: '50%', left: '50%', transform: `translate(-50%, -50%) translate(0, -${offset}px) rotate(180deg)`, zIndex: 20 };
@@ -654,8 +757,8 @@ const App: React.FC = () => {
     }
   };
 
-  const getAvatarStyle = (viewIndex: number) => {
-    switch (viewIndex) {
+  const getAvatarStyle = (stdPos: number) => {
+    switch (stdPos) {
         case 0: return { bottom: '20px', left: '20px' };
         case 1: return { bottom: '20px', right: '20px' };
         case 2: return { top: '20px', right: '20px' };
@@ -667,42 +770,79 @@ const App: React.FC = () => {
   const isMyTurn = game.turnIndex === myPlayerId;
   const canDraw = waitingReason === 'TURN_DECISION' && isMyTurn;
   const canDiscard = waitingReason === 'NONE' && isMyTurn && !isProcessing;
+  const canEat = game.lastDiscard && game.playerCount !== 2; // 2 Player Rule: No Eat
   const isSessionOver = game.players.some(p => p.chips <= 0);
   const canCut = game.phase === GamePhase.CUTTING && game.dealerIndex === myPlayerId;
   const allPlayersReady = game.players.every(p => p.isReady);
 
+
+  // --- View: Lobby ---
   if (showLobby) {
       return (
         <div className="w-full h-screen bg-[#1a472a] relative overflow-hidden text-white flex items-center justify-center">
             <div className="absolute inset-0 felt-texture opacity-50 pointer-events-none"></div>
             <div className="bg-black/80 p-8 rounded-2xl shadow-2xl text-center max-w-md w-full border border-amber-500/30 backdrop-blur-sm z-10">
-                <h1 className="text-4xl font-bold text-amber-400 mb-8 font-serif">四人車馬炮</h1>
+                <h1 className="text-4xl font-bold text-amber-400 mb-6 font-serif">四人車馬炮</h1>
                 
-                <div className="space-y-6">
-                    <button onClick={() => initGame(GameMode.SINGLEPLAYER, 0)}
+                {/* Player Count Selector */}
+                <div className="mb-6 bg-gray-800/50 p-3 rounded-lg border border-white/10">
+                    <label className="text-sm text-gray-400 block mb-2">選擇遊戲人數</label>
+                    <div className="flex justify-center gap-2">
+                        {[2, 3, 4].map(count => (
+                            <button key={count}
+                                onClick={() => setSelectedPlayerCount(count)}
+                                className={`px-4 py-2 rounded font-bold border ${selectedPlayerCount === count ? 'bg-amber-600 border-amber-400 text-white' : 'bg-gray-700 border-gray-600 text-gray-400'}`}
+                            >
+                                {count}人局
+                            </button>
+                        ))}
+                    </div>
+                    {selectedPlayerCount === 2 && <div className="text-xs text-red-400 mt-2">* 2人局規則: 不可吃牌</div>}
+                </div>
+
+                <div className="space-y-4">
+                    <button onClick={() => initGame(GameMode.SINGLEPLAYER, 0, selectedPlayerCount)}
                         className="w-full py-4 bg-amber-700 hover:bg-amber-600 rounded-lg text-xl font-bold shadow-lg border-2 border-amber-500 transition-transform hover:scale-105"
                     >
                         單人挑戰 (vs 電腦)
                     </button>
 
                     <div className="border-t border-white/10 pt-4">
-                        <h3 className="text-gray-400 mb-4 text-sm">多人連線 (模擬)</h3>
-                        <div className="grid grid-cols-2 gap-4">
-                            <button onClick={() => initGame(GameMode.MULTIPLAYER, 0)}
-                                className="py-3 bg-blue-900 hover:bg-blue-800 rounded-lg font-bold border border-blue-500"
-                            >
-                                建立房間 (P0 房主)
-                            </button>
-                            {[1, 2, 3].map(id => (
-                                <button key={id} onClick={() => initGame(GameMode.MULTIPLAYER, id)}
-                                    className="py-3 bg-gray-800 hover:bg-gray-700 rounded-lg font-bold border border-gray-600"
+                        <h3 className="text-gray-400 mb-4 text-sm font-bold">多人連線 (P2P)</h3>
+                        {!roomId ? (
+                             <div className="space-y-4">
+                                <button onClick={createRoom} disabled={isConnecting}
+                                    className="w-full py-3 bg-blue-900 hover:bg-blue-800 rounded-lg font-bold border border-blue-500 flex justify-center items-center"
                                 >
-                                    加入座位 (P{id})
+                                    {isConnecting ? <div className="w-5 h-5 border-2 border-t-transparent border-white rounded-full animate-spin"></div> : "建立房間 (我是房主)"}
                                 </button>
-                            ))}
-                        </div>
+                                
+                                <div className="flex gap-2">
+                                    <input 
+                                        type="text" 
+                                        placeholder="輸入房間代碼"
+                                        value={joinInput}
+                                        onChange={(e) => setJoinInput(e.target.value)}
+                                        className="flex-1 px-4 py-2 bg-gray-800 rounded-lg border border-gray-600 focus:outline-none focus:border-amber-400 text-center"
+                                    />
+                                    <button onClick={joinRoom} disabled={isConnecting || !joinInput}
+                                        className="px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded-lg border border-gray-500 font-bold"
+                                    >
+                                        加入
+                                    </button>
+                                </div>
+                             </div>
+                        ) : (
+                             <div className="bg-blue-900/30 p-4 rounded-lg border border-blue-500/50">
+                                 <p className="text-sm text-gray-300 mb-2">房間已建立 ({selectedPlayerCount}人)，等待加入...</p>
+                                 <div className="text-2xl font-mono font-bold text-blue-300 mb-3 tracking-wider select-text">{roomId}</div>
+                                 <button onClick={copyRoomId} className="text-sm bg-blue-600 px-3 py-1 rounded hover:bg-blue-500 transition-colors">
+                                     {copySuccess || "複製代碼分享"}
+                                 </button>
+                             </div>
+                        )}
                         <p className="text-xs text-gray-500 mt-4">
-                            * 請在同一瀏覽器的不同分頁開啟此頁面來測試連線。
+                            * 支援跨裝置連線。傳送代碼給朋友即可加入。
                         </p>
                     </div>
                 </div>
@@ -711,14 +851,18 @@ const App: React.FC = () => {
       );
   }
 
+  // --- View: Waiting Room ---
   if (game.phase === GamePhase.LOBBY) {
       return (
         <div className="w-full h-screen bg-[#1a472a] relative overflow-hidden text-white flex items-center justify-center">
             <div className="absolute inset-0 felt-texture opacity-50 pointer-events-none"></div>
             <div className="bg-black/80 p-8 rounded-2xl shadow-2xl w-full max-w-2xl border border-amber-500/30 backdrop-blur-sm z-10">
-                <h2 className="text-3xl font-bold text-amber-400 mb-6 text-center">準備室 (房間代號: DEMO)</h2>
+                <div className="flex justify-between items-center mb-6">
+                    <h2 className="text-2xl font-bold text-amber-400">準備室</h2>
+                    <div className="text-sm text-gray-400">房間: <span className="text-white font-mono">{roomId || '單機'}</span></div>
+                </div>
                 
-                <div className="grid grid-cols-4 gap-4 mb-8">
+                <div className={`grid gap-4 mb-8 ${game.playerCount === 2 ? 'grid-cols-2' : game.playerCount === 3 ? 'grid-cols-3' : 'grid-cols-4'}`}>
                     {game.players.map((p, i) => (
                         <div key={i} className={`
                             flex flex-col items-center p-4 rounded-lg border-2 
@@ -726,10 +870,12 @@ const App: React.FC = () => {
                         `}>
                             <img src={AVATARS[i]} alt={p.name} className="w-16 h-16 rounded-full mb-2 object-cover"/>
                             <div className="font-bold text-lg mb-1">{p.name}</div>
-                            <div className="text-xs text-gray-400 mb-2">{p.isHuman ? '玩家' : '電腦'}</div>
+                            <div className="text-xs text-gray-400 mb-2">
+                                {i === myPlayerId ? '你 (P' + i + ')' : (p.isHuman ? '玩家' : '電腦')}
+                            </div>
                             {p.isReady 
                                 ? <span className="text-green-400 font-bold px-3 py-1 bg-green-900/50 rounded-full text-sm">已準備</span>
-                                : <span className="text-gray-400 font-bold px-3 py-1 bg-gray-700/50 rounded-full text-sm">等待中...</span>
+                                : <span className="text-gray-400 font-bold px-3 py-1 bg-gray-700/50 rounded-full text-sm">...</span>
                             }
                         </div>
                     ))}
@@ -761,30 +907,24 @@ const App: React.FC = () => {
                         </button>
                     )}
                 </div>
-                
-                <div className="text-center mt-6 text-gray-400 text-sm">
-                    {isHost ? "您是房主，請等待所有玩家準備完成後開始遊戲。" : "請點擊準備，等待房主開始遊戲。"}
-                </div>
             </div>
         </div>
       );
   }
 
+  // --- View: Main Game ---
   return (
     <div className="w-full h-screen bg-[#1a472a] relative overflow-hidden text-white select-none">
       <div className="absolute inset-0 felt-texture opacity-50 pointer-events-none z-0"></div>
       <div className="absolute inset-0 bg-black/20 pointer-events-none z-0" style={{background: 'radial-gradient(circle at center, transparent 0%, rgba(0,0,0,0.6) 100%)'}}></div>
       
-      <button 
-        onClick={toggleMute}
-        className="absolute top-4 left-4 z-50 bg-black/40 p-2 rounded-full hover:bg-black/60 transition-colors border border-white/20"
-      >
+      <button onClick={toggleMute} className="absolute top-4 left-4 z-50 bg-black/40 p-2 rounded-full hover:bg-black/60 border border-white/20">
         {isMuted ? "🔇" : "🔊"}
       </button>
 
       <div className="absolute top-4 left-1/2 -translate-x-1/2 w-full max-w-xl pointer-events-none z-40 flex justify-center">
          <div className="bg-black/30 rounded-full px-4 py-1 backdrop-blur-sm text-amber-400/80 text-sm font-bold border border-white/5 shadow-sm">
-            車馬炮 • {game.mode === GameMode.MULTIPLAYER ? `連線模式 (我是 P${myPlayerId})` : '單機'} • 籌碼戰
+            {roomId || '單機'} • P{myPlayerId} • {game.playerCount}人局
          </div>
       </div>
       
@@ -806,35 +946,36 @@ const App: React.FC = () => {
             />
         </div>
 
-        {[0, 1, 2, 3].map(viewIndex => {
-            const playerId = getPlayerAtView(viewIndex);
-            const player = game.players[playerId];
+        {game.players.map(player => {
+            // Calculate Position
+            const stdPos = getRelativePosition(player.id, myPlayerId, game.playerCount);
+            
             return (
-                <React.Fragment key={playerId}>
-                    <div className="absolute origin-center" style={getDiscardStyle(viewIndex)}>
+                <React.Fragment key={player.id}>
+                    <div className="absolute origin-center" style={getDiscardStyle(stdPos)}>
                         {renderDiscardPile(player)}
                     </div>
-                    <div className="absolute origin-center" style={getPlayerStyle(viewIndex)}>
-                         {renderPlayerHand(player, viewIndex === 0 ? 'bottom' : viewIndex === 1 ? 'right' : viewIndex === 2 ? 'top' : 'left')}
+                    <div className="absolute origin-center" style={getPlayerStyle(stdPos)}>
+                         {renderPlayerHand(player, stdPos)}
                     </div>
-                    <div className="absolute z-30 flex flex-col items-center gap-1" style={getAvatarStyle(viewIndex)}>
+                    <div className="absolute z-30 flex flex-col items-center gap-1" style={getAvatarStyle(stdPos)}>
                         <div className={`relative w-12 h-12 rounded-full border-2 overflow-hidden shadow-lg bg-gray-800
-                            ${game.turnIndex === playerId ? 'border-yellow-400 ring-4 ring-yellow-400/30' : 'border-white/20'}
+                            ${game.turnIndex === player.id ? 'border-yellow-400 ring-4 ring-yellow-400/30' : 'border-white/20'}
                         `}>
-                            <img src={AVATARS[playerId]} alt={player?.name} className="w-full h-full object-cover" />
-                            {game.dealerIndex === playerId && (
+                            <img src={AVATARS[player.id]} alt={player.name} className="w-full h-full object-cover" />
+                            {game.dealerIndex === player.id && (
                                 <div className="absolute bottom-0 right-0 bg-red-600 text-[10px] px-1 rounded-tl-md font-bold">莊</div>
                             )}
                         </div>
                         <div className="bg-black/60 px-2 py-0.5 rounded text-xs backdrop-blur-sm text-center min-w-[60px]">
                             <div className="text-amber-200 font-bold truncate max-w-[80px]">
-                                {playerId === myPlayerId ? '我' : player?.name}
+                                {player.id === myPlayerId ? '我' : player.name}
                             </div>
-                            <div className="text-green-300">${player?.chips}</div>
+                            <div className="text-green-300">${player.chips}</div>
                         </div>
-                        {game.turnIndex === playerId && decisionTimer > 0 && (
+                        {game.turnIndex === player.id && decisionTimer > 0 && (
                         <div className="h-1 w-full bg-gray-700 rounded-full overflow-hidden mt-1">
-                            <div className="h-full bg-yellow-400 transition-all duration-1000 ease-linear" style={{width: `${(decisionTimer/6)*100}%`}}></div>
+                            <div className="h-full bg-yellow-400 transition-all duration-1000 ease-linear" style={{width: `${(decisionTimer/10)*100}%`}}></div>
                         </div>
                         )}
                     </div>
@@ -856,15 +997,13 @@ const App: React.FC = () => {
         <div className="pointer-events-auto flex gap-4 items-end pb-4">
             {canDraw && (
                 <>
-                    <button 
-                        onClick={() => dispatchAction('ACTION_DRAW')}
+                    <button onClick={() => dispatchAction('ACTION_DRAW')}
                         className="bg-blue-600 hover:bg-blue-500 text-white px-8 py-3 rounded-full shadow-lg font-bold text-lg border-2 border-blue-400 hover:scale-105 active:scale-95 transition-transform"
                     >
                         摸牌 ({decisionTimer}s)
                     </button>
-                    {game.lastDiscard && (
-                        <button 
-                            onClick={() => dispatchAction('ACTION_EAT')}
+                    {canEat && game.lastDiscard && (
+                        <button onClick={() => dispatchAction('ACTION_EAT')}
                             className="bg-emerald-600 hover:bg-emerald-500 text-white px-8 py-3 rounded-full shadow-lg font-bold text-lg border-2 border-emerald-400 hover:scale-105 active:scale-95 transition-transform"
                         >
                             吃牌
@@ -896,14 +1035,12 @@ const App: React.FC = () => {
             {waitingReason === 'HU' && game.players[myPlayerId].isHuman && (
                 winningTile && checkWinWithTile(game.players[myPlayerId].hand, winningTile) && 
                 <div className="flex gap-4 animate-pulse">
-                    <button 
-                        onClick={() => dispatchAction('ACTION_WIN')}
+                    <button onClick={() => dispatchAction('ACTION_WIN')}
                         className="bg-red-600 hover:bg-red-500 text-white px-8 py-3 rounded-full shadow-xl font-bold text-2xl border-2 border-red-300"
                     >
                         胡牌!
                     </button>
-                    <button 
-                        onClick={() => dispatchAction('ACTION_PASS')}
+                    <button onClick={() => dispatchAction('ACTION_PASS')}
                         className="bg-gray-600 hover:bg-gray-500 text-white px-6 py-3 rounded-full shadow-lg font-bold text-lg border-2 border-gray-400"
                     >
                         過
@@ -912,8 +1049,7 @@ const App: React.FC = () => {
             )}
 
             {canDiscard && checkWin(game.players[myPlayerId].hand) && (
-                 <button 
-                    onClick={() => dispatchAction('ACTION_WIN')}
+                 <button onClick={() => dispatchAction('ACTION_WIN')}
                     className="bg-red-600 hover:bg-red-500 text-white px-8 py-3 rounded-full shadow-xl font-bold text-2xl border-2 border-red-300 ml-4"
                 >
                     自摸!
@@ -926,7 +1062,7 @@ const App: React.FC = () => {
           <div className="absolute top-20 left-1/2 -translate-x-1/2 z-50">
              <div className="bg-black/60 text-white px-4 py-1 rounded-full text-sm flex items-center gap-2 backdrop-blur-md">
                  <div className="w-3 h-3 rounded-full border-2 border-t-transparent border-white animate-spin"></div>
-                 {isHost ? '電腦思考中...' : '等待房主回應...'}
+                 {isHost ? '處理中...' : '等待房主...'}
              </div>
           </div>
       )}
