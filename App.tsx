@@ -244,7 +244,8 @@ const App: React.FC = () => {
             if (msg.type === 'ASSIGN_ID') {
                 const myId = msg.payload.id;
                 setMyPlayerId(myId);
-                initGame(GameMode.MULTIPLAYER, myId, 4); 
+                // Note: We don't call initGame here to avoid overwriting state before sync
+                // We wait for SYNC_STATE
             }
             else if (msg.type === 'SYNC_STATE') {
                 const serverState = msg.payload;
@@ -763,10 +764,10 @@ const App: React.FC = () => {
   // --- View: Lobby ---
   if (showLobby) {
       return (
-        <div className="w-full h-screen bg-[#1a472a] relative overflow-hidden text-white flex items-center justify-center">
-            <div className="absolute inset-0 felt-texture opacity-50 pointer-events-none"></div>
-            <div className="bg-black/80 p-8 rounded-2xl shadow-2xl text-center max-w-md w-full border border-amber-500/30 backdrop-blur-sm z-10">
-                <h1 className="text-4xl font-bold text-amber-400 mb-6 font-serif">四人車馬炮</h1>
+        <div className="w-full min-h-screen bg-[#1a472a] relative overflow-y-auto text-white flex items-center justify-center p-4">
+            <div className="absolute inset-0 felt-texture opacity-50 pointer-events-none fixed"></div>
+            <div className="bg-black/80 p-6 md:p-8 rounded-2xl shadow-2xl text-center max-w-md w-full border border-amber-500/30 backdrop-blur-sm z-10 my-8">
+                <h1 className="text-3xl md:text-4xl font-bold text-amber-400 mb-6 font-serif">四人車馬炮</h1>
                 
                 {/* Player Count Selector */}
                 <div className="mb-6 bg-gray-800/50 p-3 rounded-lg border border-white/10">
@@ -849,10 +850,22 @@ const App: React.FC = () => {
 
   // --- View: Waiting Room ---
   if (game.phase === GamePhase.LOBBY) {
+      // FIX: Check if player data is synced before rendering
+      if (!game.players[myPlayerId]) {
+          return (
+            <div className="w-full h-screen bg-[#1a472a] flex items-center justify-center text-white">
+                <div className="text-center">
+                    <div className="w-8 h-8 border-4 border-t-amber-400 border-white/20 rounded-full animate-spin mx-auto mb-4"></div>
+                    <p>正在連線中...</p>
+                </div>
+            </div>
+          );
+      }
+
       return (
-        <div className="w-full h-screen bg-[#1a472a] relative overflow-hidden text-white flex items-center justify-center">
-            <div className="absolute inset-0 felt-texture opacity-50 pointer-events-none"></div>
-            <div className="bg-black/80 p-8 rounded-2xl shadow-2xl w-full max-w-2xl border border-amber-500/30 backdrop-blur-sm z-10">
+        <div className="w-full min-h-screen bg-[#1a472a] relative overflow-y-auto text-white flex items-center justify-center p-4">
+            <div className="absolute inset-0 felt-texture opacity-50 pointer-events-none fixed"></div>
+            <div className="bg-black/80 p-6 md:p-8 rounded-2xl shadow-2xl w-full max-w-2xl border border-amber-500/30 backdrop-blur-sm z-10 my-8">
                 <div className="flex justify-between items-center mb-6">
                     <h2 className="text-2xl font-bold text-amber-400">準備室</h2>
                     <div className="text-sm text-gray-400">房間: <span className="text-white font-mono">{roomId || '單機'}</span></div>
