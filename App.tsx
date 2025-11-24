@@ -42,7 +42,7 @@ const App: React.FC = () => {
     winnerId: null,
     loserId: null,
     winningHand: null,
-    logs: ["歡迎來到車馬炮！"],
+    logs: ["歡迎來到臺灣象棋麻將！"],
   });
 
   // Multiplayer State
@@ -52,6 +52,7 @@ const App: React.FC = () => {
   const [roomId, setRoomId] = useState<string>(""); 
   
   // Inputs
+  const [playerNameInput, setPlayerNameInput] = useState<string>("玩家");
   const [joinInput, setJoinInput] = useState<string>("");
   const [createRoomIdInput, setCreateRoomIdInput] = useState<string>(""); 
 
@@ -72,24 +73,20 @@ const App: React.FC = () => {
 
   // --- Initialization ---
 
-  const initGame = (mode: GameMode, myId: number, count: number) => {
+  const initGame = (mode: GameMode, myId: number, count: number, myName: string = "玩家") => {
     audioService.playBGM();
     const isMultiplayer = mode === GameMode.MULTIPLAYER;
     const host = isMultiplayer ? myId === 0 : true;
 
     const players: Player[] = Array.from({ length: count }).map((_, i) => ({
       id: i,
-      name: PLAYER_NAMES[i] || `玩家 ${i}`,
+      name: (i === myId) ? myName : (isMultiplayer ? "等待加入..." : PLAYER_NAMES[i]),
       isHuman: isMultiplayer ? (i === myId) : (i === 0), 
       isReady: !isMultiplayer || (host && i === 0) || (i !== 0 && i !== myId), 
       hand: [],
       discards: [],
       chips: 100 
     }));
-    
-    if (isMultiplayer && host) {
-        players.forEach((p, i) => { if (i !== 0) p.name = "等待加入..."; });
-    }
     
     if (isMultiplayer && !host) {
         if(players[myId]) players[myId].isReady = false;
@@ -110,7 +107,7 @@ const App: React.FC = () => {
       winnerId: null,
       loserId: null,
       winningHand: null,
-      logs: [`模式: ${isMultiplayer ? '多人連線' : '單機'} (${count}人)`, `我是玩家: ${myId}`],
+      logs: [`模式: ${isMultiplayer ? '多人連線' : '單機'} (${count}人)`, `我是 ${myName}`],
     });
 
     setNextRoundDealer(randomStarter);
@@ -140,12 +137,16 @@ const App: React.FC = () => {
           alert("房間代碼必須是5位英數字 (A-Z, 0-9)");
           return;
       }
+      if (!playerNameInput.trim()) {
+          alert("請輸入您的暱稱");
+          return;
+      }
 
       setIsConnecting(true);
       try {
           const id = await multiplayerService.init(createRoomIdInput, false);
           setRoomId(id);
-          initGame(GameMode.MULTIPLAYER, 0, selectedPlayerCount);
+          initGame(GameMode.MULTIPLAYER, 0, selectedPlayerCount, playerNameInput);
           
           // Setup Host Handshake
           multiplayerService.setHostMessageHandler((msg, peerId) => {
@@ -168,13 +169,19 @@ const App: React.FC = () => {
 
   const joinRoom = async () => {
       if (!joinInput) return;
+      if (!playerNameInput.trim()) {
+          alert("請輸入您的暱稱");
+          return;
+      }
+
       setIsConnecting(true);
       try {
           await multiplayerService.init(undefined, false);
           await multiplayerService.connectToHost(joinInput);
           setIsHost(false);
           
-          multiplayerService.send('REQUEST_JOIN', { name: "玩家" });
+          // Send Request to Host with Name
+          multiplayerService.send('REQUEST_JOIN', { name: playerNameInput });
           
           audioService.playBGM();
           setGame(prev => ({ ...prev, logs: ["正在連線到房間..."] }));
@@ -197,7 +204,7 @@ const App: React.FC = () => {
           if (emptyIndex !== -1) {
               newPlayers[emptyIndex] = {
                   ...newPlayers[emptyIndex],
-                  name: `玩家 ${emptyIndex}`,
+                  name: name || `玩家 ${emptyIndex}`, // Use provided name
                   isHuman: true,
                   isReady: false
               };
@@ -206,7 +213,7 @@ const App: React.FC = () => {
               
               setTimeout(() => broadcastState(newPlayers), 100);
               
-              return { ...prev, players: newPlayers, logs: [...prev.logs, `玩家 ${emptyIndex} 加入連線`] };
+              return { ...prev, players: newPlayers, logs: [...prev.logs, `${name} 加入連線`] };
           }
           return prev;
       });
@@ -214,8 +221,6 @@ const App: React.FC = () => {
 
   // --- Network Listeners ---
   
-  // CRITICAL FIX: Added 'game' to dependency array.
-  // This prevents stale closures where the host processes actions using old game state.
   useEffect(() => {
     multiplayerService.setOnMessage((msg: NetworkMessage) => {
         if (isHost) {
@@ -235,7 +240,9 @@ const App: React.FC = () => {
         } else {
             if (msg.type === 'ASSIGN_ID') {
                 const myId = msg.payload.id;
+                const myName = msg.payload.name;
                 setMyPlayerId(myId);
+                // initGame is not strictly needed here as SYNC_STATE follows immediately
             }
             else if (msg.type === 'SYNC_STATE') {
                 const serverState = msg.payload;
@@ -336,7 +343,6 @@ const App: React.FC = () => {
               case 'ACTION_CUT': if(payload.index !== undefined) handleCutWall(payload.index); break;
               case 'ACTION_TOGGLE_READY': 
                  setGame(prev => {
-                     // FIX: Use .map for immutable update to guarantee re-render and effect trigger
                      const newPlayers = prev.players.map((p, i) => 
                         i === sender ? { ...p, isReady: !p.isReady } : p
                      );
@@ -477,6 +483,31 @@ const App: React.FC = () => {
             nextDealer = (winnerId + 1) % count;
             if (newPlayers[nextDealer]) payoutLogs.push(`下局莊家: ${newPlayers[nextDealer].name} (自摸者下家)`);
         }
+        
+        // --- SAVE GAME HISTORY TO LOCALSTORAGE ---
+        if (isHost) {
+            setTimeout(() => {
+                try {
+                    const historyItem = {
+                        timestamp: new Date().toLocaleString(),
+                        roomId: roomId || 'Singleplayer',
+                        winner: newPlayers[winnerId].name,
+                        winningHand: winningHand.map(t => t.label).join(' '),
+                        loser: loserId !== null ? newPlayers[loserId].name : '自摸',
+                        scores: newPlayers.map(p => ({ name: p.name, chips: p.chips })),
+                    };
+                    const savedHistory = localStorage.getItem('xiangqi_game_history');
+                    const historyList = savedHistory ? JSON.parse(savedHistory) : [];
+                    historyList.unshift(historyItem); // Add to top
+                    if (historyList.length > 50) historyList.pop(); // Limit size
+                    localStorage.setItem('xiangqi_game_history', JSON.stringify(historyList));
+                } catch (e) {
+                    console.error("Error saving history:", e);
+                }
+            }, 0);
+        }
+        // -----------------------------------------
+
         setNextRoundDealer(nextDealer);
         return { ...current, players: newPlayers, logs: [...current.logs, ...payoutLogs] };
      });
@@ -759,7 +790,7 @@ const App: React.FC = () => {
         <div className="w-full min-h-screen bg-[#1a472a] relative overflow-y-auto text-white flex items-center justify-center p-4">
             <div className="absolute inset-0 felt-texture opacity-50 pointer-events-none fixed"></div>
             <div className="bg-black/80 p-6 md:p-8 rounded-2xl shadow-2xl text-center max-w-md w-full border border-amber-500/30 backdrop-blur-sm z-10 my-8">
-                <h1 className="text-3xl md:text-4xl font-bold text-amber-400 mb-6 font-serif">四人車馬炮</h1>
+                <h1 className="text-3xl md:text-4xl font-bold text-amber-400 mb-6 font-serif">臺灣象棋麻將</h1>
                 
                 {/* Player Count Selector */}
                 <div className="mb-6 bg-gray-800/50 p-3 rounded-lg border border-white/10">
@@ -777,8 +808,20 @@ const App: React.FC = () => {
                     {selectedPlayerCount === 2 && <div className="text-xs text-red-400 mt-2">* 2人局規則: 不可吃牌</div>}
                 </div>
 
+                {/* Player Name Input */}
+                <div className="mb-6">
+                    <input 
+                        type="text" 
+                        placeholder="請輸入您的暱稱 (最多6字)"
+                        value={playerNameInput}
+                        onChange={(e) => setPlayerNameInput(e.target.value)}
+                        maxLength={6}
+                        className="w-full px-4 py-3 bg-gray-800 rounded-lg border border-amber-500 focus:outline-none text-center shadow-inner text-lg"
+                    />
+                </div>
+
                 <div className="space-y-4">
-                    <button onClick={() => initGame(GameMode.SINGLEPLAYER, 0, selectedPlayerCount)}
+                    <button onClick={() => initGame(GameMode.SINGLEPLAYER, 0, selectedPlayerCount, playerNameInput || "玩家")}
                         className="w-full py-4 bg-amber-700 hover:bg-amber-600 rounded-lg text-xl font-bold shadow-lg border-2 border-amber-500 transition-transform hover:scale-105"
                     >
                         單人挑戰 (vs 電腦)
@@ -787,7 +830,7 @@ const App: React.FC = () => {
                     <div className="border-t border-white/10 pt-4">
                         <h3 className="text-gray-400 mb-4 text-sm font-bold">多人連線 (P2P)</h3>
                         
-                        {/* Lobby Logic: Create Room with Custom ID */}
+                        {/* Create Room */}
                         {!roomId ? (
                              <div className="space-y-4">
                                 <div className="flex gap-2">
@@ -806,7 +849,7 @@ const App: React.FC = () => {
                                     </button>
                                 </div>
                                 
-                                {/* Join Room Input - Vertical stack for mobile visibility */}
+                                {/* Join Room - Stacked */}
                                 <div className="flex flex-col sm:flex-row gap-2 pt-4 border-t border-white/10">
                                     <input 
                                         type="text" 
@@ -841,7 +884,6 @@ const App: React.FC = () => {
       );
   }
 
-  // --- View: Waiting Room ---
   if (game.phase === GamePhase.LOBBY) {
       // FIX: Check if player data is synced before rendering
       if (!game.players[myPlayerId]) {
